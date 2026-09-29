@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "field-lineage"
+version = "0.1.0"
+description = "Field-level data lineage tracking without a data warehouse"
+requires-python = ">=3.10"
+readme = "README.md"
+
+[project.scripts]
+lineage = "lineage.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lineage*"]
