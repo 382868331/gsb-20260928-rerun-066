@@ -22,6 +22,16 @@
 - 同名版本核对：`field_identity_report(field_id)` 列出同名字段所属对象、版本和分支，避免只按字段名匹配。
 - 循环安全：BFS 遇到回到起点的环边不会无限扩展；结果的 `cycles` 会报告可达环。
 
+## 待审草稿与发布历史
+
+多个映射方案可以作为**草稿**同时存在、彼此隔离，正式图之外的试算关系不会进入 `upstream`/`impact` 等普通查询：
+
+- `create_draft`：以当前有效图修订号为基线，提交一个或多个转换替换方案，覆盖字段替换、多来源合并和反馈边；整批先校验后保存，任何映射非法或保存中断都不留下草稿、不改动有效图。
+- `draft_diff`：对当前有效图试算差异，返回 `added_edges`/`removed_edges`、`new_dependencies`（新增的传递依赖）、`lost_sources`（失去来源的目标字段及剩余来源，`orphaned` 标记完全失去来源的结果）和 `cycles`（发布后存在的循环，并标注是否为新增循环）。
+- `publish_draft`：只有基线仍是当前修订号时才发布为新的有效图修订；同一份旧版基线被他人抢先发布时抛出 `BaselineChangedError`，后一份草稿不会覆盖前一份成果。
+- `rebase_draft`：用户查看刷新后的差异并重新确认后，把草稿锚定到新基线；刷新差异会显式暴露与已发布方案的冲突（例如新方案会移除别人新增的边）。
+- `withdraw_revision`：撤回一次发布，把图恢复到该修订发布之前的完整快照；撤回本身也是一个新修订，发布、撤回的前后完整图都永久保留在历史时间线上，可用 `revision_graph` 审计。
+
 ## Python API
 
 ```python
@@ -56,6 +66,35 @@ service.replace_transform(
     [("orders.v1.region", "enriched.v1.segment", "lower(region)")],
 )
 service.delete_transform("transforms.segment.v1")
+
+# 待审草稿：试算、差异、乐观发布与撤回
+draft = service.create_draft(
+    "drafts.segment.v2",
+    [
+        {
+            "transform_id": "transforms.segment.v1",
+            "mappings": [
+                ("orders.v1.region", "enriched.v1.segment", "lower(region)"),
+                ("customers.v2.tier", "enriched.v1.segment", "coalesce(tier, 'unknown')"),
+            ],
+        },
+        {  # 也可以在草稿中引入一个全新的转换（需要 name/version）
+            "transform_id": "transforms.feedback.v1",
+            "name": "segment_feedback",
+            "version": "1.0.0",
+            "mappings": [("enriched.v1.segment", "orders.v1.region", "feedback(segment)")],
+        },
+    ],
+)
+service.draft_diff("drafts.segment.v2")
+try:
+    service.publish_draft("drafts.segment.v2")
+except BaselineChangedError as conflict:
+    # 基线已被另一份草稿推进：重新看差异、确认后再发布
+    service.draft_diff("drafts.segment.v2")
+    service.rebase_draft("drafts.segment.v2")
+    service.publish_draft("drafts.segment.v2")
+service.withdraw_revision(1)  # 撤回发布，历史图仍可通过 revision_graph 查看
 ```
 
 建议由提交方生成稳定、可读且全局唯一的 ID，例如：
@@ -78,13 +117,22 @@ python -m lineage.cli --store lineage.json impact orders.v1.region
 python -m lineage.cli --store lineage.json delete-transform t.segment.v1
 python -m lineage.cli --store lineage.json replace-transform t.segment.v1 --mapping orders.v1.region enriched.v1.segment 'lower(region)'
 python -m lineage.cli --store lineage.json list contributions
+
+# 草稿与发布历史
+python -m lineage.cli --store lineage.json draft-create d1 t.segment.v1 --mapping orders.v1.region enriched.v1.segment 'lower(region)'
+python -m lineage.cli --store lineage.json draft-diff d1
+python -m lineage.cli --store lineage.json draft-publish d1
+python -m lineage.cli --store lineage.json draft-rebase d1   # 基线变化后重新确认
+python -m lineage.cli --store lineage.json withdraw-revision 1
+python -m lineage.cli --store lineage.json revision-graph 1
+python -m lineage.cli --store lineage.json list revisions
 ```
 
 安装为包后也可以使用 `lineage --store lineage.json ...`。
 
 ## 持久化格式
 
-JSON 文件包含四个顶层集合：`objects`、`fields`、`transforms`、`contributions`。保存采用临时文件加原子替换，适合当前单机、低频提交的工具集成场景。其他处理工具可以直接复用 `LineageService` 提交同构关系；后续也可以把 `JsonLineageStore` 替换成数据库仓储，而保持服务接口不变。
+JSON 文件包含 `objects`、`fields`、`transforms`、`contributions` 四个有效图集合，以及 `drafts`（待审方案）、`revisions` 和 `current_revision`（发布时间线，每个修订保存发布前后的完整图快照）。保存采用临时文件加原子替换，适合当前单机、低频提交的工具集成场景。草稿保存、草稿发布和撤回都遵循「先校验/先快照、单次落盘、失败回滚内存与磁盘」的原则；批量错误或落盘失败不会留下半截关系，撤回也不会抹掉任何历史修订。其他处理工具可以直接复用 `LineageService` 提交同构关系；后续也可以把 `JsonLineageStore` 替换成数据库仓储，而保持服务接口不变。
 
 ## 测试
 

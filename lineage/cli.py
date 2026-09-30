@@ -134,7 +134,33 @@ def build_parser() -> argparse.ArgumentParser:
     impact.add_argument("field_id")
 
     list_items = subparsers.add_parser("list")
-    list_items.add_argument("kind", choices=["objects", "fields", "transforms", "contributions"])
+    list_items.add_argument("kind", choices=["objects", "fields", "transforms", "contributions", "drafts", "revisions"])
+
+    draft_create = subparsers.add_parser("draft-create")
+    draft_create.add_argument("draft_id")
+    draft_create.add_argument("transform_id")
+    draft_create.add_argument("--mapping", action="append", nargs=3,
+                              metavar=("SOURCE_FIELD", "TARGET_FIELD", "EXPRESSION"), required=True)
+    draft_create.add_argument("--name")
+    draft_create.add_argument("--version")
+    draft_create.add_argument("--code-ref")
+    draft_create.add_argument("--description")
+
+    draft_diff = subparsers.add_parser("draft-diff")
+    draft_diff.add_argument("draft_id")
+
+    draft_rebase = subparsers.add_parser("draft-rebase")
+    draft_rebase.add_argument("draft_id")
+
+    draft_publish = subparsers.add_parser("draft-publish")
+    draft_publish.add_argument("draft_id")
+    draft_publish.add_argument("--force", action="store_true")
+
+    draft_withdraw = subparsers.add_parser("withdraw-revision")
+    draft_withdraw.add_argument("revision", type=int)
+
+    revision_graph = subparsers.add_parser("revision-graph")
+    revision_graph.add_argument("revision", type=int)
     return parser
 
 
@@ -216,8 +242,53 @@ def main(argv: list[str] | None = None) -> None:
             payload = [_field_dict(x) for x in service.store.fields.values()]
         elif args.kind == "transforms":
             payload = [_transform_dict(x) for x in service.store.transforms.values()]
+        elif args.kind == "drafts":
+            payload = [x.to_dict() for x in service.list_drafts(include_closed=True)]
+        elif args.kind == "revisions":
+            payload = [
+                {k: v for k, v in x.to_dict().items() if not k.startswith("graph_")}
+                for x in service.list_revisions()
+            ]
         else:
             payload = [_contribution_dict(service, x) for x in service.store.contributions.values()]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    elif args.command == "draft-create":
+        proposal = {
+            "transform_id": args.transform_id,
+            "mappings": [
+                [source, target, expression or None]
+                for source, target, expression in args.mapping
+            ],
+            "name": args.name,
+            "version": args.version,
+            "code_ref": args.code_ref,
+            "description": args.description,
+        }
+        draft = service.create_draft(args.draft_id, [proposal])
+        print(json.dumps(draft.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "draft-diff":
+        payload = service.draft_diff(args.draft_id).to_dict()
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    elif args.command == "draft-rebase":
+        draft = service.rebase_draft(args.draft_id)
+        print(json.dumps(draft.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "draft-publish":
+        payload = service.publish_draft(args.draft_id, force=args.force)
+        payload["diff"] = {
+            key: value for key, value in payload["diff"].items()
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    elif args.command == "withdraw-revision":
+        payload = service.withdraw_revision(args.revision)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    elif args.command == "revision-graph":
+        payload = service.revision_graph(args.revision)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
     else:  # pragma: no cover

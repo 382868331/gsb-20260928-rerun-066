@@ -1,11 +1,26 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from .exceptions import AlreadyExistsError, NotFoundError, ValidationError
-from .models import Contribution, DataObject, Field, TransformVersion
+from .drafting import DraftDiff, diff_draft
+from .exceptions import (
+    AlreadyExistsError,
+    BaselineChangedError,
+    NotFoundError,
+    ValidationError,
+)
+from .models import (
+    Contribution,
+    DataObject,
+    Draft,
+    DraftTransformProposal,
+    Field,
+    GraphRevision,
+    TransformVersion,
+)
 from .store import JsonLineageStore
 
 
@@ -403,6 +418,369 @@ class LineageService:
             transform.active = False
             raise
         return affected
+
+    # ------------------------------------------------------------------
+    # Pending drafts, trial diffs, optimistic publish and graph history
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _ensure_baseline_revision(self) -> None:
+        """Lazily record revision 0 so every published graph has a parent."""
+
+        if not self.store.revisions:
+            self.store.revisions.append(
+                GraphRevision(
+                    revision=0,
+                    kind="baseline",
+                    created_at=self._now(),
+                    graph_before=None,
+                    graph_after=self.store.snapshot_graph(),
+                )
+            )
+            self.store.current_revision = 0
+
+    def create_draft(
+        self,
+        draft_id: str,
+        proposals: Iterable[
+            dict[str, Any] | DraftTransformProposal
+            | tuple[str, Iterable[tuple[str, str, str | None]]]
+        ],
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> Draft:
+        """Create an isolated pending mapping scheme against the current graph.
+
+        Each proposal replaces one transform's full active mapping set inside
+        the draft; transforms may be brand new (``name``/``version`` given).
+        The whole batch is validated before anything is saved, and the draft
+        never touches the effective graph used by ordinary queries.
+        """
+
+        if draft_id in self.store.drafts:
+            raise AlreadyExistsError(f"draft '{draft_id}' already exists")
+
+        normalized = [self._normalize_proposal(item) for item in proposals]
+        if not normalized:
+            raise ValidationError("a draft must contain at least one proposal")
+        seen_transforms: set[str] = set()
+        for proposal in normalized:
+            if proposal.transform_id in seen_transforms:
+                raise ValidationError(
+                    f"duplicate proposal for transform '{proposal.transform_id}' in draft"
+                )
+            seen_transforms.add(proposal.transform_id)
+            self._validate_proposal(proposal)
+
+        self._ensure_baseline_revision()
+        draft = Draft(
+            id=draft_id,
+            proposals=normalized,
+            base_revision=self.store.current_revision,
+            status="open",
+            created_at=self._now(),
+            metadata=metadata or {},
+        )
+        self.store.drafts[draft_id] = draft
+        try:
+            self.store.save()
+        except Exception:
+            self.store.drafts.pop(draft_id, None)
+            raise
+        return draft
+
+    @staticmethod
+    def _normalize_proposal(item: Any) -> DraftTransformProposal:
+        if isinstance(item, DraftTransformProposal):
+            normalized_mappings = [tuple(mapping) for mapping in item.mappings]
+            return DraftTransformProposal(
+                transform_id=item.transform_id,
+                mappings=normalized_mappings,
+                name=item.name,
+                version=item.version,
+                code_ref=item.code_ref,
+                description=item.description,
+            )
+        if isinstance(item, dict):
+            return DraftTransformProposal(
+                transform_id=item["transform_id"],
+                mappings=[tuple(mapping) for mapping in item.get("mappings", [])],
+                name=item.get("name"),
+                version=item.get("version"),
+                code_ref=item.get("code_ref"),
+                description=item.get("description"),
+            )
+        if isinstance(item, tuple) and len(item) == 2:
+            transform_id, mappings = item
+            return DraftTransformProposal(
+                transform_id=transform_id,
+                mappings=[tuple(mapping) for mapping in mappings],
+            )
+        raise ValidationError("invalid draft proposal")
+
+    def _validate_proposal(self, proposal: DraftTransformProposal) -> None:
+        if not proposal.transform_id:
+            raise ValidationError("proposal transform_id is required")
+        if not proposal.mappings:
+            raise ValidationError(
+                f"proposal for transform '{proposal.transform_id}' must have at least one mapping"
+            )
+        existing = self.store.transforms.get(proposal.transform_id)
+        if existing is None and not (proposal.name and proposal.version):
+            raise NotFoundError(
+                f"transform '{proposal.transform_id}' does not exist; new transforms need name and version"
+            )
+        planned_keys: set[tuple[str, str]] = set()
+        for mapping in proposal.mappings:
+            source_id, target_id = mapping[0], mapping[1]
+            self._check_mapping_fields(source_id, target_id)
+            key = (source_id, target_id)
+            if key in planned_keys:
+                raise AlreadyExistsError(
+                    f"duplicate mapping {source_id} -> {target_id} in proposal "
+                    f"for transform '{proposal.transform_id}'"
+                )
+            planned_keys.add(key)
+
+    def get_draft(self, draft_id: str) -> Draft:
+        try:
+            return self.store.drafts[draft_id]
+        except KeyError:
+            raise NotFoundError(f"draft '{draft_id}' does not exist") from None
+
+    def list_drafts(self, *, include_closed: bool = False) -> list[Draft]:
+        return [
+            draft
+            for draft in self.store.drafts.values()
+            if include_closed or draft.status == "open"
+        ]
+
+    def draft_diff(self, draft_id: str) -> DraftDiff:
+        """Trial-run a draft against the current effective graph.
+
+        Trial edges are never written, so ordinary queries stay unaffected.
+        ``baseline_changed`` flags drafts prepared against an older revision.
+        """
+
+        draft = self.get_draft(draft_id)
+        if draft.status != "open":
+            raise ValidationError(f"draft '{draft_id}' is {draft.status}, not open")
+        for proposal in draft.proposals:
+            self._validate_proposal(proposal)
+        return diff_draft(
+            self.store, draft.id, draft.base_revision, draft.proposals
+        )
+
+    def rebase_draft(self, draft_id: str) -> Draft:
+        """Re-anchor an outdated draft to the current revision for re-confirmation."""
+
+        draft = self.get_draft(draft_id)
+        if draft.status != "open":
+            raise ValidationError(f"draft '{draft_id}' is {draft.status}, not open")
+        for proposal in draft.proposals:
+            self._validate_proposal(proposal)
+        old_base = draft.base_revision
+        draft.base_revision = self.store.current_revision
+        try:
+            self.store.save()
+        except Exception:
+            draft.base_revision = old_base
+            raise
+        return draft
+
+    def publish_draft(self, draft_id: str, *, force: bool = False) -> dict[str, Any]:
+        """Publish one confirmed scheme as a new effective-graph revision.
+
+        Drafts based on an outdated revision are rejected with
+        :class:`BaselineChangedError`; callers show the refreshed diff and use
+        :meth:`rebase_draft` before re-publishing. Publication replaces each
+        proposed transform's edge set atomically and keeps the complete graph
+        before/after on the revision timeline. Nothing already published is
+        overwritten by a stale draft.
+        """
+
+        draft = self.get_draft(draft_id)
+        if draft.status != "open":
+            raise ValidationError(f"draft '{draft_id}' is {draft.status}, not open")
+        for proposal in draft.proposals:
+            self._validate_proposal(proposal)
+        if draft.base_revision != self.store.current_revision and not force:
+            raise BaselineChangedError(
+                (
+                    f"draft '{draft_id}' is based on revision {draft.base_revision} "
+                    f"but the effective graph is now at revision "
+                    f"{self.store.current_revision}; review the refreshed diff and "
+                    "rebase before publishing"
+                ),
+                draft_id=draft_id,
+                base_revision=draft.base_revision,
+                current_revision=self.store.current_revision,
+            )
+
+        self._ensure_baseline_revision()
+        graph_before = self.store.snapshot_graph()
+        diff = diff_draft(
+            self.store, draft.id, draft.base_revision, draft.proposals
+        )
+
+        checkpoint = self.store.snapshot_graph()
+        saved_draft_status = draft.status
+        previous_revision = self.store.current_revision
+        revision_recorded = False
+        try:
+            self._apply_proposals(draft.proposals)
+            draft.status = "published"
+            new_revision = self.store.current_revision + 1
+            draft.published_revision = new_revision
+            self.store.current_revision = new_revision
+            self.store.revisions.append(
+                GraphRevision(
+                    revision=new_revision,
+                    kind="publish",
+                    created_at=self._now(),
+                    draft_id=draft_id,
+                    graph_before=graph_before,
+                    graph_after=self.store.snapshot_graph(),
+                )
+            )
+            self.store.save()
+        except Exception:
+            self.store.restore_graph(checkpoint)
+            draft.status = saved_draft_status
+            draft.published_revision = None
+            self.store.current_revision = previous_revision
+            if revision_recorded and self.store.revisions:
+                self.store.revisions.pop()
+            raise
+        return {
+            "draft_id": draft_id,
+            "revision": new_revision,
+            "diff": diff.to_dict(),
+        }
+
+    def _apply_proposals(self, proposals: list[DraftTransformProposal]) -> None:
+        for proposal in proposals:
+            transform = self.store.transforms.get(proposal.transform_id)
+            if transform is None:
+                transform = TransformVersion(
+                    id=proposal.transform_id,
+                    name=proposal.name,
+                    version=proposal.version,
+                    code_ref=proposal.code_ref,
+                    description=proposal.description,
+                )
+                self.store.transforms[proposal.transform_id] = transform
+            else:
+                if proposal.name is not None:
+                    transform.name = proposal.name
+                if proposal.version is not None:
+                    transform.version = proposal.version
+                if proposal.code_ref is not None:
+                    transform.code_ref = proposal.code_ref
+                if proposal.description is not None:
+                    transform.description = proposal.description
+                transform.active = True
+
+            keep: set[str] = set()
+            for source_id, target_id, expression in proposal.mappings:
+                contribution_id = self._contribution_id(
+                    proposal.transform_id, source_id, target_id
+                )
+                keep.add(contribution_id)
+                existing = self.store.contributions.get(contribution_id)
+                if existing is None:
+                    self.store.contributions[contribution_id] = Contribution(
+                        id=contribution_id,
+                        transform_id=proposal.transform_id,
+                        source_field_id=source_id,
+                        target_field_id=target_id,
+                        expression=expression,
+                    )
+                else:
+                    existing.active = True
+                    existing.expression = expression
+            for edge in list(self.store.contributions.values()):
+                if edge.transform_id == proposal.transform_id and edge.id not in keep:
+                    edge.active = False
+
+    def withdraw_revision(self, revision: int) -> dict[str, Any]:
+        """Withdraw a published revision by restoring its pre-publish graph.
+
+        The withdrawn revision and its graph snapshots stay on the timeline;
+        the restored graph becomes a new revision, so withdrawal itself is a
+        full historical graph rather than a destructive rewrite.
+        """
+
+        record = next(
+            (item for item in self.store.revisions if item.revision == revision),
+            None,
+        )
+        if record is None:
+            raise NotFoundError(f"revision {revision} does not exist")
+        if record.kind != "publish":
+            raise ValidationError(f"revision {revision} is {record.kind}, not publish")
+        if record.graph_before is None:
+            raise ValidationError(f"revision {revision} has no graph snapshot to restore")
+
+        graph_before = self.store.snapshot_graph()
+        checkpoint = graph_before
+        new_revision = self.store.current_revision + 1
+        revision_recorded = False
+        try:
+            self.store.restore_graph(record.graph_before)
+            if record.draft_id:
+                draft = self.store.drafts.get(record.draft_id)
+                if draft is not None:
+                    draft.status = "withdrawn"
+                    draft.withdrawn_revision = new_revision
+            self.store.current_revision = new_revision
+            self.store.revisions.append(
+                GraphRevision(
+                    revision=new_revision,
+                    kind="withdraw",
+                    created_at=self._now(),
+                    draft_id=record.draft_id,
+                    withdrawn_from=revision,
+                    graph_before=graph_before,
+                    graph_after=self.store.snapshot_graph(),
+                )
+            )
+            revision_recorded = True
+            self.store.save()
+        except Exception:
+            self.store.restore_graph(checkpoint)
+            self.store.current_revision = new_revision - 1
+            if revision_recorded and self.store.revisions:
+                self.store.revisions.pop()
+            if record.draft_id:
+                draft = self.store.drafts.get(record.draft_id)
+                if draft is not None:
+                    draft.status = "published"
+                    draft.withdrawn_revision = None
+            raise
+        return {
+            "withdrawn_revision": revision,
+            "revision": new_revision,
+            "draft_id": record.draft_id,
+        }
+
+    def list_revisions(self) -> list[GraphRevision]:
+        return list(self.store.revisions)
+
+    def revision_graph(self, revision: int) -> dict[str, Any]:
+        record = next(
+            (item for item in self.store.revisions if item.revision == revision),
+            None,
+        )
+        if record is None:
+            raise NotFoundError(f"revision {revision} does not exist")
+        snapshot = record.graph_after or record.graph_before
+        if snapshot is None:
+            raise NotFoundError(f"revision {revision} has no graph snapshot")
+        return snapshot
 
     def field_identity_report(self, field_id: str) -> dict[str, Any]:
         """Return object/version/branch context needed to disambiguate names."""
