@@ -111,6 +111,17 @@ def build_parser() -> argparse.ArgumentParser:
     delete = subparsers.add_parser("delete-transform")
     delete.add_argument("transform_id")
 
+    replace = subparsers.add_parser("replace-mappings")
+    replace.add_argument("transform_id")
+    replace.add_argument(
+        "--mapping",
+        action="append",
+        nargs="+",
+        metavar="SOURCE_TARGET_[EXPRESSION]",
+        required=True,
+        help="repeat for each mapping: SOURCE TARGET [EXPRESSION]",
+    )
+
     restore = subparsers.add_parser("restore-transform")
     restore.add_argument("transform_id")
 
@@ -168,6 +179,15 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.command == "delete-transform":
         payload = {"deactivated_contributions": service.delete_transform(args.transform_id)}
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    elif args.command == "replace-mappings":
+        mappings = [
+            (*group[:2], group[2] if len(group) > 2 else None)
+            for group in args.mapping
+        ]
+        updated = service.replace_transform_mappings(args.transform_id, mappings)
+        payload = [_contribution_dict(service, item) for item in updated]
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
     elif args.command == "restore-transform":

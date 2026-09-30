@@ -43,21 +43,23 @@ class LineageService:
         metadata: dict[str, Any] | None = None,
         exist_ok: bool = False,
     ) -> DataObject:
-        existing = self.store.objects.get(object_id)
-        if existing is not None:
-            if not exist_ok:
-                raise AlreadyExistsError(f"data object '{object_id}' already exists")
-            return existing
-        obj = DataObject(
-            id=object_id,
-            name=name,
-            version=version,
-            branch=branch,
-            metadata=metadata or {},
-        )
-        self.store.objects[object_id] = obj
-        self.store.save()
-        return obj
+        with self.store.atomic():
+            existing = self.store.objects.get(object_id)
+            if existing is not None:
+                if not exist_ok:
+                    raise AlreadyExistsError(
+                        f"data object '{object_id}' already exists"
+                    )
+                return existing
+            obj = DataObject(
+                id=object_id,
+                name=name,
+                version=version,
+                branch=branch,
+                metadata=metadata or {},
+            )
+            self.store.objects[object_id] = obj
+            return obj
 
     def create_field(
         self,
@@ -69,35 +71,37 @@ class LineageService:
         metadata: dict[str, Any] | None = None,
         exist_ok: bool = False,
     ) -> Field:
-        existing = self.store.fields.get(field_id)
-        if existing is not None:
-            if not exist_ok:
-                raise AlreadyExistsError(f"field '{field_id}' already exists")
-            return existing
-        if object_id not in self.store.objects:
-            raise NotFoundError(f"data object '{object_id}' does not exist")
-        duplicate = next(
-            (
-                item
-                for item in self.store.fields.values()
-                if item.object_id == object_id and item.name == name
-            ),
-            None,
-        )
-        if duplicate is not None:
-            raise AlreadyExistsError(
-                f"field name '{name}' already exists in object '{object_id}'"
+        with self.store.atomic():
+            existing = self.store.fields.get(field_id)
+            if existing is not None:
+                if not exist_ok:
+                    raise AlreadyExistsError(f"field '{field_id}' already exists")
+                return existing
+            if object_id not in self.store.objects:
+                raise NotFoundError(
+                    f"data object '{object_id}' does not exist"
+                )
+            duplicate = next(
+                (
+                    item
+                    for item in self.store.fields.values()
+                    if item.object_id == object_id and item.name == name
+                ),
+                None,
             )
-        field_item = Field(
-            id=field_id,
-            object_id=object_id,
-            name=name,
-            data_type=data_type,
-            metadata=metadata or {},
-        )
-        self.store.fields[field_id] = field_item
-        self.store.save()
-        return field_item
+            if duplicate is not None:
+                raise AlreadyExistsError(
+                    f"field name '{name}' already exists in object '{object_id}'"
+                )
+            field_item = Field(
+                id=field_id,
+                object_id=object_id,
+                name=name,
+                data_type=data_type,
+                metadata=metadata or {},
+            )
+            self.store.fields[field_id] = field_item
+            return field_item
 
     def create_transform(
         self,
@@ -109,6 +113,78 @@ class LineageService:
         description: str | None = None,
         metadata: dict[str, Any] | None = None,
         exist_ok: bool = False,
+    ) -> TransformVersion:
+        with self.store.atomic():
+            return self._ensure_transform(
+                transform_id,
+                name,
+                version,
+                code_ref=code_ref,
+                description=description,
+                metadata=metadata,
+                exist_ok=exist_ok,
+            )
+
+    def add_contribution(
+        self,
+        source_field_id: str,
+        target_field_id: str,
+        transform_id: str,
+        *,
+        expression: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        exist_ok: bool = False,
+    ) -> Contribution:
+        with self.store.atomic():
+            return self._add_contribution(
+                source_field_id,
+                target_field_id,
+                transform_id,
+                expression=expression,
+                metadata=metadata,
+                exist_ok=exist_ok,
+            )
+
+    def _validate_mappings(
+        self,
+        transform_id: str,
+        mappings: list[tuple[str, str, str | None]],
+    ) -> None:
+        """Validate a whole mapping batch before any graph mutation."""
+
+        if not mappings:
+            raise ValidationError("a transform must contribute at least one mapping")
+        if transform_id not in self.store.transforms:
+            raise NotFoundError(f"transform '{transform_id}' does not exist")
+        seen_pairs: set[tuple[str, str]] = set()
+        for source_id, target_id, _expression in mappings:
+            if source_id not in self.store.fields:
+                raise NotFoundError(
+                    f"source field '{source_id}' does not exist"
+                )
+            if target_id not in self.store.fields:
+                raise NotFoundError(
+                    f"target field '{target_id}' does not exist"
+                )
+            if source_id == target_id:
+                raise ValidationError("a field cannot contribute to itself")
+            pair = (source_id, target_id)
+            if pair in seen_pairs:
+                raise ValidationError(
+                    f"duplicate mapping {source_id} -> {target_id} in same batch"
+                )
+            seen_pairs.add(pair)
+
+    def _ensure_transform(
+        self,
+        transform_id: str,
+        name: str,
+        version: str,
+        *,
+        code_ref: str | None,
+        description: str | None,
+        metadata: dict[str, Any] | None,
+        exist_ok: bool,
     ) -> TransformVersion:
         existing = self.store.transforms.get(transform_id)
         if existing is not None:
@@ -126,18 +202,17 @@ class LineageService:
             metadata=metadata or {},
         )
         self.store.transforms[transform_id] = transform
-        self.store.save()
         return transform
 
-    def add_contribution(
+    def _add_contribution(
         self,
         source_field_id: str,
         target_field_id: str,
         transform_id: str,
         *,
-        expression: str | None = None,
-        metadata: dict[str, Any] | None = None,
-        exist_ok: bool = False,
+        expression: str | None,
+        metadata: dict[str, Any] | None,
+        exist_ok: bool,
     ) -> Contribution:
         if source_field_id not in self.store.fields:
             raise NotFoundError(f"source field '{source_field_id}' does not exist")
@@ -175,7 +250,6 @@ class LineageService:
             metadata=metadata or {},
         )
         self.store.contributions[contribution_id] = contribution
-        self.store.save()
         return contribution
 
     def submit_transform(
@@ -193,68 +267,112 @@ class LineageService:
         """Create one transform and all of its source-to-target edges atomically."""
 
         mappings = list(mappings)
-        if not mappings:
-            raise ValidationError("a transform must contribute at least one mapping")
-        self.create_transform(
-            transform_id,
-            name,
-            version,
-            code_ref=code_ref,
-            description=description,
-            metadata=transform_metadata,
-            exist_ok=exist_ok,
-        )
-        added: list[Contribution] = []
-        try:
-            for source_id, target_id, expression in mappings:
-                added.append(
-                    self.add_contribution(
-                        source_id,
-                        target_id,
-                        transform_id,
-                        expression=expression,
-                        exist_ok=exist_ok,
-                    )
+        with self.store.atomic():
+            self._ensure_transform(
+                transform_id,
+                name,
+                version,
+                code_ref=code_ref,
+                description=description,
+                metadata=transform_metadata,
+                exist_ok=exist_ok,
+            )
+            self._validate_mappings(transform_id, mappings)
+            return [
+                self._add_contribution(
+                    source_id,
+                    target_id,
+                    transform_id,
+                    expression=expression,
+                    metadata=None,
+                    exist_ok=exist_ok,
                 )
-        except Exception:
-            for contribution in added:
-                self.store.contributions.pop(contribution.id, None)
-            if not exist_ok:
-                self.store.transforms.pop(transform_id, None)
-            raise
-        return added
+                for source_id, target_id, expression in mappings
+            ]
+
+    def replace_transform_mappings(
+        self,
+        transform_id: str,
+        mappings: Iterable[tuple[str, str, str | None]],
+    ) -> list[Contribution]:
+        """Atomically replace every active edge of one transform version.
+
+        The old contributions and the new ones are never active in the same
+        graph version: validation runs first, then all edits commit with a
+        single atomic save.  Removed edges are soft-deactivated so their audit
+        history is retained while excluded from effective queries.
+        """
+
+        mappings = list(mappings)
+        with self.store.atomic():
+            self._validate_mappings(transform_id, mappings)
+            new_pairs = {
+                (source_id, target_id): expression
+                for source_id, target_id, expression in mappings
+            }
+            for edge in self.store.contributions.values():
+                if edge.transform_id == transform_id and edge.active:
+                    pair = (edge.source_field_id, edge.target_field_id)
+                    if pair not in new_pairs:
+                        edge.active = False
+            result: list[Contribution] = []
+            for source_id, target_id, expression in mappings:
+                contribution_id = (
+                    f"contrib:{transform_id}:{source_id}->{target_id}"
+                )
+                existing = self.store.contributions.get(contribution_id)
+                if existing is not None:
+                    existing.active = True
+                    existing.expression = expression
+                    result.append(existing)
+                else:
+                    result.append(
+                        self._add_contribution(
+                            source_id,
+                            target_id,
+                            transform_id,
+                            expression=expression,
+                            metadata=None,
+                            exist_ok=False,
+                        )
+                    )
+            return result
 
     def delete_transform(self, transform_id: str) -> list[str]:
         """Withdraw only edges contributed by one transform version."""
 
-        transform = self.store.transforms.get(transform_id)
-        if transform is None:
-            raise NotFoundError(f"transform '{transform_id}' does not exist")
-        affected = [
-            contribution_id
-            for contribution_id, item in self.store.contributions.items()
-            if item.transform_id == transform_id and item.active
-        ]
-        for contribution_id in affected:
-            self.store.contributions[contribution_id].active = False
-        transform.active = False
-        self.store.save()
-        return affected
+        with self.store.atomic():
+            transform = self.store.transforms.get(transform_id)
+            if transform is None:
+                raise NotFoundError(
+                    f"transform '{transform_id}' does not exist"
+                )
+            affected = [
+                contribution_id
+                for contribution_id, item in self.store.contributions.items()
+                if item.transform_id == transform_id and item.active
+            ]
+            for contribution_id in affected:
+                self.store.contributions[contribution_id].active = False
+            transform.active = False
+            return affected
 
     def restore_transform(self, transform_id: str) -> list[str]:
-        transform = self.store.transforms.get(transform_id)
-        if transform is None:
-            raise NotFoundError(f"transform '{transform_id}' does not exist")
-        affected = [
-            contribution_id
-            for contribution_id, item in self.store.contributions.items()
-            if item.transform_id == transform_id and not item.active
-        ]
-        for contribution_id in affected:
-            self.store.contributions[contribution_id].active = True
-        transform.active = True
-        self.store.save()
-        return affected
+        with self.store.atomic():
+            transform = self.store.transforms.get(transform_id)
+            if transform is None:
+                raise NotFoundError(
+                    f"transform '{transform_id}' does not exist"
+                )
+            affected = [
+                contribution_id
+                for contribution_id, item in self.store.contributions.items()
+                if item.transform_id == transform_id and not item.active
+            ]
+            for contribution_id in affected:
+                self.store.contributions[contribution_id].active = True
+            transform.active = True
+            return affected
 
     def field_identity_report(self, field_id: str) -> dict[str, Any]:
         """Return object/version/branch context needed to disambiguate names."""
@@ -306,6 +424,10 @@ class LineageService:
                 continue
             transform = self.store.transforms.get(edge.transform_id)
             if transform is not None and not transform.active:
+                continue
+            if edge.source_field_id not in self.store.fields:
+                continue
+            if edge.target_field_id not in self.store.fields:
                 continue
             adjacency[incoming_key(edge)].append(edge)
             active_edges[edge.id] = edge

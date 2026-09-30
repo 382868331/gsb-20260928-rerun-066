@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from .models import Contribution, DataObject, Field, TransformVersion
 
@@ -61,10 +64,43 @@ class JsonLineageStore:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, ensure_ascii=False, indent=2)
                 handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(temporary_name, self.path)
         except BaseException:
             try:
                 os.unlink(temporary_name)
             except FileNotFoundError:
                 pass
+            raise
+
+    def snapshot(self) -> dict[str, dict]:
+        return {
+            "objects": copy.deepcopy(self.objects),
+            "fields": copy.deepcopy(self.fields),
+            "transforms": copy.deepcopy(self.transforms),
+            "contributions": copy.deepcopy(self.contributions),
+        }
+
+    def restore(self, state: dict[str, dict]) -> None:
+        self.objects = copy.deepcopy(state["objects"])
+        self.fields = copy.deepcopy(state["fields"])
+        self.transforms = copy.deepcopy(state["transforms"])
+        self.contributions = copy.deepcopy(state["contributions"])
+
+    @contextmanager
+    def atomic(self) -> Iterator[None]:
+        """Commit a batch of in-memory edits with a single save.
+
+        On failure the in-memory graph is rolled back to the snapshot taken at
+        entry, so a rejected batch can never leave half of its edges in the
+        current graph.  Nothing is persisted until the whole batch succeeds.
+        """
+
+        state = self.snapshot()
+        try:
+            yield
+            self.save()
+        except BaseException:
+            self.restore(state)
             raise

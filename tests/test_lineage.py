@@ -2,7 +2,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from lineage import AlreadyExistsError, JsonLineageStore, LineageService
+from lineage import (
+    AlreadyExistsError,
+    Contribution,
+    JsonLineageStore,
+    LineageService,
+    NotFoundError,
+)
 
 
 class LineageServiceTest(unittest.TestCase):
@@ -147,6 +153,227 @@ class LineageServiceTest(unittest.TestCase):
             self.service.create_field("a.v1.x", "a.v1", "x")
         with self.assertRaises(AlreadyExistsError):
             self.service.create_field("a.v1.x2", "a.v1", "x")
+
+    def seed_chain(self):
+        for name in ["a", "b", "c", "d"]:
+            self.object(f"{name}.v1", name, "v1")
+            self.field(f"{name}.v1.x", f"{name}.v1", "x")
+
+    def test_failed_submit_is_absent_from_memory_and_reopened_graph(self):
+        self.seed_chain()
+        with self.assertRaises(NotFoundError):
+            self.service.submit_transform(
+                "t.partial",
+                "partial",
+                "1",
+                [
+                    ("a.v1.x", "b.v1.x", "ok-first"),
+                    ("a.v1.x", "missing.v1.x", "broken-second"),
+                ],
+            )
+
+        self.assertNotIn("t.partial", self.service.store.transforms)
+        self.assertEqual(
+            [
+                edge.id
+                for edge in self.service.store.contributions.values()
+                if edge.transform_id == "t.partial"
+            ],
+            [],
+        )
+        self.assertEqual(self.service.impact("a.v1.x").direct, {})
+
+        reloaded = LineageService(JsonLineageStore(self.service.store.path))
+        self.assertNotIn("t.partial", reloaded.store.transforms)
+        self.assertEqual(
+            [
+                edge.id
+                for edge in reloaded.store.contributions.values()
+                if edge.transform_id == "t.partial"
+            ],
+            [],
+        )
+        self.assertEqual(reloaded.impact("a.v1.x").direct, {})
+
+    def test_duplicate_resubmit_does_not_leave_partial_batch(self):
+        self.seed_chain()
+        self.service.submit_transform(
+            "t.ab", "ab", "1", [("a.v1.x", "b.v1.x", "first")]
+        )
+        with self.assertRaises(AlreadyExistsError):
+            self.service.submit_transform(
+                "t.ab",
+                "ab",
+                "1",
+                [
+                    ("a.v1.x", "b.v1.x", "dup"),
+                    ("b.v1.x", "c.v1.x", "never-saved"),
+                ],
+            )
+        partial_edges = [
+            edge
+            for edge in self.service.store.contributions.values()
+            if edge.transform_id == "t.ab"
+        ]
+        self.assertEqual(len(partial_edges), 1)
+        self.assertEqual(
+            self.service.store.contributions[
+                "contrib:t.ab:a.v1.x->b.v1.x"
+            ].expression,
+            "first",
+        )
+        reloaded = LineageService(JsonLineageStore(self.service.store.path))
+        self.assertEqual(set(reloaded.impact("a.v1.x").direct), {"b.v1.x"})
+        self.assertEqual(reloaded.impact("b.v1.x").direct, {})
+
+    def test_save_interruption_keeps_last_complete_version(self):
+        self.seed_chain()
+        self.service.submit_transform(
+            "t.ab", "ab", "1", [("a.v1.x", "b.v1.x", "first")]
+        )
+        from lineage import store as store_module
+
+        original_dump = store_module.json.dump
+
+        def failing_dump(payload, handle, **kwargs):
+            raise OSError("disk full during write")
+
+        store_module.json.dump = failing_dump
+        try:
+            with self.assertRaises(OSError):
+                self.service.replace_transform_mappings(
+                    "t.ab",
+                    [
+                        ("a.v1.x", "c.v1.x", "moved"),
+                        ("a.v1.x", "d.v1.x", "also-moved"),
+                    ],
+                )
+        finally:
+            store_module.json.dump = original_dump
+
+        self.assertEqual(set(self.service.impact("a.v1.x").direct), {"b.v1.x"})
+        reloaded = LineageService(JsonLineageStore(self.service.store.path))
+        self.assertEqual(set(reloaded.impact("a.v1.x").direct), {"b.v1.x"})
+
+    def test_replace_mappings_switches_without_mixing_versions(self):
+        self.seed_chain()
+        self.service.submit_transform(
+            "t.route",
+            "route",
+            "1",
+            [
+                ("a.v1.x", "b.v1.x", "old-b"),
+                ("a.v1.x", "c.v1.x", "old-c"),
+            ],
+        )
+        active_ids_before = {
+            edge.id
+            for edge in self.service.store.contributions.values()
+            if edge.active and edge.transform_id == "t.route"
+        }
+
+        updated = self.service.replace_transform_mappings(
+            "t.route",
+            [
+                ("a.v1.x", "c.v1.x", "new-c"),
+                ("a.v1.x", "d.v1.x", "new-d"),
+            ],
+        )
+
+        self.assertEqual(
+            {(edge.source_field_id, edge.target_field_id) for edge in updated},
+            {("a.v1.x", "c.v1.x"), ("a.v1.x", "d.v1.x")},
+        )
+        self.assertEqual(set(self.service.impact("a.v1.x").direct), {"c.v1.x", "d.v1.x"})
+        self.assertEqual(
+            self.service.store.contributions[
+                "contrib:t.route:a.v1.x->c.v1.x"
+            ].expression,
+            "new-c",
+        )
+        self.assertFalse(
+            self.service.store.contributions[
+                "contrib:t.route:a.v1.x->b.v1.x"
+            ].active
+        )
+        active_ids_after = {
+            edge.id
+            for edge in self.service.store.contributions.values()
+            if edge.active and edge.transform_id == "t.route"
+        }
+        self.assertEqual(
+            active_ids_before & active_ids_after,
+            {"contrib:t.route:a.v1.x->c.v1.x"},
+        )
+
+        reloaded = LineageService(JsonLineageStore(self.service.store.path))
+        self.assertEqual(set(reloaded.impact("a.v1.x").direct), {"c.v1.x", "d.v1.x"})
+
+    def test_replace_with_broken_reference_changes_nothing(self):
+        self.seed_chain()
+        self.service.submit_transform(
+            "t.route", "route", "1", [("a.v1.x", "b.v1.x", "old")]
+        )
+        with self.assertRaises(NotFoundError):
+            self.service.replace_transform_mappings(
+                "t.route", [("a.v1.x", "ghost.v1.x", "ghost")]
+            )
+        self.assertEqual(set(self.service.impact("a.v1.x").direct), {"b.v1.x"})
+        reloaded = LineageService(JsonLineageStore(self.service.store.path))
+        self.assertEqual(set(reloaded.impact("a.v1.x").direct), {"b.v1.x"})
+
+    def test_historical_dangling_edges_are_retained_but_not_traversed(self):
+        self.seed_chain()
+        self.service.submit_transform(
+            "t.ab", "ab", "1", [("a.v1.x", "b.v1.x", "live")]
+        )
+        self.service.store.contributions["contrib:legacy:b.v1.x->ghost.v1.x"] = (
+            Contribution(
+                id="contrib:legacy:b.v1.x->ghost.v1.x",
+                transform_id="t.ab",
+                source_field_id="b.v1.x",
+                target_field_id="ghost.v1.x",
+                expression="dangling history",
+            )
+        )
+        self.service.store.save()
+
+        impact = self.service.impact("a.v1.x")
+        self.assertEqual(set(impact.direct), {"b.v1.x"})
+        self.assertNotIn("contrib:legacy:b.v1.x->ghost.v1.x", impact.edges)
+
+        reloaded = LineageService(JsonLineageStore(self.service.store.path))
+        self.assertIn(
+            "contrib:legacy:b.v1.x->ghost.v1.x",
+            reloaded.store.contributions,
+        )
+        reloaded_impact = reloaded.impact("a.v1.x")
+        self.assertEqual(set(reloaded_impact.direct), {"b.v1.x"})
+        self.assertNotIn(
+            "contrib:legacy:b.v1.x->ghost.v1.x", reloaded_impact.edges
+        )
+
+    def test_cycle_traversal_remains_bounded_after_replacements(self):
+        for name in ["a", "b"]:
+            self.object(f"{name}.v1", name, "v1")
+            self.field(f"{name}.v1.x", f"{name}.v1", "x")
+        self.service.submit_transform(
+            "t.loop",
+            "loop",
+            "1",
+            [("a.v1.x", "b.v1.x", "forward")],
+        )
+        self.service.replace_transform_mappings(
+            "t.loop",
+            [
+                ("a.v1.x", "b.v1.x", "forward"),
+                ("b.v1.x", "a.v1.x", "feedback"),
+            ],
+        )
+        result = self.service.impact("a.v1.x")
+        self.assertEqual(set(result.direct), {"b.v1.x"})
+        self.assertEqual(result.transitive, {})
+        self.assertTrue(result.cycles)
 
 
 if __name__ == "__main__":
