@@ -133,8 +133,40 @@ def build_parser() -> argparse.ArgumentParser:
     impact = subparsers.add_parser("impact")
     impact.add_argument("field_id")
 
+
+    draft = subparsers.add_parser("create-draft")
+    draft.add_argument("id")
+    draft.add_argument("name")
+    draft.add_argument("--metadata")
+
+    stage = subparsers.add_parser("stage-transform")
+    stage.add_argument("draft_id")
+    stage.add_argument("transform_id")
+    stage.add_argument("name")
+    stage.add_argument("version")
+    stage.add_argument("--code-ref")
+    stage.add_argument("--mapping", action="append", nargs=3,
+                       metavar=("SOURCE_FIELD", "TARGET_FIELD", "EXPRESSION"), required=True)
+
+    diff = subparsers.add_parser("draft-diff")
+    diff.add_argument("draft_id")
+
+    publish = subparsers.add_parser("publish-draft")
+    publish.add_argument("draft_id")
+    publish.add_argument("--confirm-stale", action="store_true")
+    publish.add_argument("--note")
+
+    discard = subparsers.add_parser("discard-draft")
+    discard.add_argument("draft_id")
+
+    withdraw = subparsers.add_parser("withdraw-publish")
+    withdraw.add_argument("history_id")
+    withdraw.add_argument("--note")
+
+    subparsers.add_parser("history")
+
     list_items = subparsers.add_parser("list")
-    list_items.add_argument("kind", choices=["objects", "fields", "transforms", "contributions"])
+    list_items.add_argument("kind", choices=["objects", "fields", "transforms", "contributions", "drafts"])
     return parser
 
 
@@ -209,6 +241,36 @@ def main(argv: list[str] | None = None) -> None:
         payload = _query_dict(service.impact(args.field_id), service)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
+    elif args.command == "create-draft":
+        result = service.create_draft(args.id, args.name, metadata=_metadata(args.metadata))
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "stage-transform":
+        mappings = [(s, t, e or None) for s, t, e in args.mapping]
+        result = service.stage_transform(
+            args.draft_id, args.transform_id, args.name, args.version, mappings,
+            code_ref=args.code_ref,
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "draft-diff":
+        print(json.dumps(service.draft_diff(args.draft_id).to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "publish-draft":
+        result = service.publish_draft(
+            args.draft_id, confirm_stale=args.confirm_stale, note=args.note
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "discard-draft":
+        print(json.dumps(service.discard_draft(args.draft_id).to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "withdraw-publish":
+        print(json.dumps(service.withdraw_publish(args.history_id, note=args.note).to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "history":
+        print(json.dumps([item.to_dict() for item in service.history()], ensure_ascii=False, indent=2))
+        return
     elif args.command == "list":
         if args.kind == "objects":
             payload = [_object_dict(x) for x in service.store.objects.values()]
@@ -216,6 +278,8 @@ def main(argv: list[str] | None = None) -> None:
             payload = [_field_dict(x) for x in service.store.fields.values()]
         elif args.kind == "transforms":
             payload = [_transform_dict(x) for x in service.store.transforms.values()]
+        elif args.kind == "drafts":
+            payload = [x.to_dict() for x in service.store.drafts.values()]
         else:
             payload = [_contribution_dict(service, x) for x in service.store.contributions.values()]
         print(json.dumps(payload, ensure_ascii=False, indent=2))

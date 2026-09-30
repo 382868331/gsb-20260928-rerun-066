@@ -5,7 +5,14 @@ import os
 import tempfile
 from pathlib import Path
 
-from .models import Contribution, DataObject, Field, TransformVersion
+from .models import (
+    Contribution,
+    DataObject,
+    DraftProposal,
+    Field,
+    HistoryEntry,
+    TransformVersion,
+)
 
 
 class JsonLineageStore:
@@ -21,6 +28,9 @@ class JsonLineageStore:
         self.fields: dict[str, Field] = {}
         self.transforms: dict[str, TransformVersion] = {}
         self.contributions: dict[str, Contribution] = {}
+        self.drafts: dict[str, DraftProposal] = {}
+        self.history: list[HistoryEntry] = []
+        self.revision: int = 0
         if self.path.exists():
             self.load()
 
@@ -43,6 +53,14 @@ class JsonLineageStore:
             item["id"]: Contribution.from_dict(item)
             for item in raw.get("contributions", [])
         }
+        self.drafts = {
+            item["id"]: DraftProposal.from_dict(item)
+            for item in raw.get("drafts", [])
+        }
+        self.history = [
+            HistoryEntry.from_dict(item) for item in raw.get("history", [])
+        ]
+        self.revision = int(raw.get("revision", 0))
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -53,6 +71,9 @@ class JsonLineageStore:
             "contributions": [
                 item.to_dict() for item in self.contributions.values()
             ],
+            "drafts": [item.to_dict() for item in self.drafts.values()],
+            "history": [item.to_dict() for item in self.history],
+            "revision": self.revision,
         }
         fd, temporary_name = tempfile.mkstemp(
             prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent

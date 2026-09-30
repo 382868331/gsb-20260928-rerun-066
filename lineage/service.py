@@ -4,8 +4,21 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from .exceptions import AlreadyExistsError, NotFoundError, ValidationError
-from .models import Contribution, DataObject, Field, TransformVersion
+from .exceptions import (
+    AlreadyExistsError,
+    NotFoundError,
+    StaleBaselineError,
+    ValidationError,
+)
+from .models import (
+    Contribution,
+    DataObject,
+    DraftMapping,
+    DraftProposal,
+    Field,
+    HistoryEntry,
+    TransformVersion,
+)
 from .store import JsonLineageStore
 
 
@@ -556,3 +569,444 @@ class LineageService:
             return self.store.objects[object_id]
         except KeyError:
             raise NotFoundError(f"data object '{object_id}' does not exist") from None
+
+    # --- Draft proposals -------------------------------------------------
+
+    def create_draft(
+        self,
+        draft_id: str,
+        name: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        exist_ok: bool = False,
+    ) -> DraftProposal:
+        """Open an isolated what-if proposal pinned to the current revision."""
+
+        existing = self.store.drafts.get(draft_id)
+        if existing is not None:
+            if not exist_ok:
+                raise AlreadyExistsError(f"draft '{draft_id}' already exists")
+            return existing
+        draft = DraftProposal(
+            id=draft_id,
+            name=name,
+            base_revision=self.store.revision,
+            metadata=metadata or {},
+        )
+        self.store.drafts[draft_id] = draft
+        self.store.save()
+        return draft
+
+    def stage_transform(
+        self,
+        draft_id: str,
+        transform_id: str,
+        name: str,
+        version: str,
+        mappings: Iterable[tuple[str, str, str | None]],
+        *,
+        code_ref: str | None = None,
+        description: str | None = None,
+    ) -> DraftProposal:
+        """Stage a transform replacement inside a draft.
+
+        Staged edges live only on the draft; effective-graph queries never see
+        them until the draft is published. All mappings are validated before
+        the draft record is mutated, so a bad batch leaves the draft unchanged.
+        """
+
+        draft = self._require_draft(draft_id)
+        if draft.status != "open":
+            raise ValidationError(f"draft '{draft_id}' is {draft.status}")
+        mappings = list(mappings)
+        if not mappings:
+            raise ValidationError("a transform must contribute at least one mapping")
+        staged: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for source_id, target_id, expression in mappings:
+            self._check_mapping_fields(source_id, target_id)
+            key = (source_id, target_id)
+            if key in seen:
+                raise AlreadyExistsError("identical contribution already exists")
+            seen.add(key)
+            staged.append(
+                {
+                    "source_field_id": source_id,
+                    "target_field_id": target_id,
+                    "expression": expression,
+                }
+            )
+        draft.transforms = [
+            item for item in draft.transforms if item.transform_id != transform_id
+        ]
+        draft.transforms.append(
+            DraftMapping(
+                transform_id=transform_id,
+                name=name,
+                version=version,
+                code_ref=code_ref,
+                description=description,
+                mappings=staged,
+            )
+        )
+        self.store.save()
+        return draft
+
+    def discard_draft(self, draft_id: str) -> DraftProposal:
+        draft = self._require_draft(draft_id)
+        if draft.status != "open":
+            raise ValidationError(f"draft '{draft_id}' is {draft.status}")
+        draft.status = "discarded"
+        self.store.save()
+        return draft
+
+    def draft_diff(self, draft_id: str) -> DraftDiff:
+        """Compare a draft against the current effective graph.
+
+        Reports dependencies the draft would add, active dependencies it would
+        remove, target fields that lose sources, and cycles that would appear.
+        """
+
+        draft = self._require_draft(draft_id)
+        current_edges = self._effective_edges()
+        simulated = dict(current_edges)
+        for staged in draft.transforms:
+            for edge_id, edge in list(simulated.items()):
+                if edge.transform_id == staged.transform_id:
+                    del simulated[edge_id]
+            for mapping in staged.mappings:
+                edge_id = self._contribution_id(
+                    staged.transform_id,
+                    mapping["source_field_id"],
+                    mapping["target_field_id"],
+                )
+                simulated[edge_id] = Contribution(
+                    id=edge_id,
+                    transform_id=staged.transform_id,
+                    source_field_id=mapping["source_field_id"],
+                    target_field_id=mapping["target_field_id"],
+                    expression=mapping.get("expression"),
+                )
+
+        current_keys = {
+            (edge.transform_id, edge.source_field_id, edge.target_field_id)
+            for edge in current_edges.values()
+        }
+        simulated_keys = {
+            (edge.transform_id, edge.source_field_id, edge.target_field_id)
+            for edge in simulated.values()
+        }
+        added = sorted(simulated_keys - current_keys)
+        removed = sorted(current_keys - simulated_keys)
+
+        current_sources: dict[str, set[str]] = defaultdict(set)
+        for edge in current_edges.values():
+            current_sources[edge.target_field_id].add(edge.source_field_id)
+        simulated_sources: dict[str, set[str]] = defaultdict(set)
+        for edge in simulated.values():
+            simulated_sources[edge.target_field_id].add(edge.source_field_id)
+        lost = {
+            target: sorted(current_sources[target] - simulated_sources.get(target, set()))
+            for target in current_sources
+            if current_sources[target] - simulated_sources.get(target, set())
+        }
+
+        current_cycles = {tuple(c) for c in self._graph_cycles(current_edges.values())}
+        new_cycles = [
+            cycle
+            for cycle in self._graph_cycles(simulated.values())
+            if tuple(cycle) not in current_cycles
+        ]
+        return DraftDiff(
+            draft_id=draft.id,
+            base_revision=draft.base_revision,
+            current_revision=self.store.revision,
+            stale=draft.base_revision != self.store.revision,
+            added_dependencies=[
+                {"transform_id": t, "source_field_id": s, "target_field_id": g}
+                for t, s, g in added
+            ],
+            removed_dependencies=[
+                {"transform_id": t, "source_field_id": s, "target_field_id": g}
+                for t, s, g in removed
+            ],
+            lost_sources=lost,
+            new_cycles=new_cycles,
+        )
+
+    def publish_draft(
+        self,
+        draft_id: str,
+        *,
+        confirm_stale: bool = False,
+        note: str | None = None,
+    ) -> HistoryEntry:
+        """Atomically apply a draft to the effective graph and record history.
+
+        If another proposal was published after this draft's baseline, the
+        publish is rejected with StaleBaselineError unless confirm_stale=True
+        is passed after the user re-confirmed against the new baseline. On any
+        validation or persistence failure the in-memory and on-disk graphs are
+        left exactly as before, and the full pre-publish graph is snapshotted
+        into the history entry.
+        """
+
+        draft = self._require_draft(draft_id)
+        if draft.status != "open":
+            raise ValidationError(f"draft '{draft_id}' is {draft.status}")
+        if not draft.transforms:
+            raise ValidationError("draft has no staged transforms")
+        if draft.base_revision != self.store.revision and not confirm_stale:
+            raise StaleBaselineError(
+                draft_id, draft.base_revision, self.store.revision
+            )
+        for staged in draft.transforms:
+            for mapping in staged.mappings:
+                self._check_mapping_fields(
+                    mapping["source_field_id"], mapping["target_field_id"]
+                )
+
+        backup_transforms = dict(self.store.transforms)
+        backup_contributions = {
+            key: Contribution(**item.to_dict())
+            for key, item in self.store.contributions.items()
+        }
+        backup_revision = self.store.revision
+        activated: list[str] = []
+        deactivated: list[str] = []
+        created_transforms: list[str] = []
+        try:
+            for staged in draft.transforms:
+                transform = self.store.transforms.get(staged.transform_id)
+                if transform is None:
+                    transform = TransformVersion(
+                        id=staged.transform_id,
+                        name=staged.name,
+                        version=staged.version,
+                        code_ref=staged.code_ref,
+                        description=staged.description,
+                    )
+                    self.store.transforms[transform.id] = transform
+                    created_transforms.append(transform.id)
+                else:
+                    transform.active = True
+                    transform.name = staged.name
+                    transform.version = staged.version
+                    if staged.code_ref is not None:
+                        transform.code_ref = staged.code_ref
+                keep: set[str] = set()
+                for mapping in staged.mappings:
+                    edge_id = self._contribution_id(
+                        staged.transform_id,
+                        mapping["source_field_id"],
+                        mapping["target_field_id"],
+                    )
+                    keep.add(edge_id)
+                    edge = self.store.contributions.get(edge_id)
+                    if edge is None:
+                        self.store.contributions[edge_id] = Contribution(
+                            id=edge_id,
+                            transform_id=staged.transform_id,
+                            source_field_id=mapping["source_field_id"],
+                            target_field_id=mapping["target_field_id"],
+                            expression=mapping.get("expression"),
+                        )
+                    else:
+                        edge.active = True
+                        edge.expression = mapping.get("expression")
+                    activated.append(edge_id)
+                for edge in self.store.contributions.values():
+                    if (
+                        edge.transform_id == staged.transform_id
+                        and edge.active
+                        and edge.id not in keep
+                    ):
+                        edge.active = False
+                        deactivated.append(edge.id)
+            self.store.revision += 1
+            draft.status = "published"
+            entry = HistoryEntry(
+                id=f"history:r{self.store.revision}:publish:{draft_id}",
+                revision=self.store.revision,
+                action="publish",
+                draft_id=draft_id,
+                note=note,
+                activated=activated,
+                deactivated=deactivated,
+                created_transforms=created_transforms,
+                snapshot=self._graph_snapshot(),
+            )
+            self.store.history.append(entry)
+            self.store.save()
+        except Exception:
+            self.store.transforms = backup_transforms
+            self.store.contributions = backup_contributions
+            self.store.revision = backup_revision
+            draft.status = "open"
+            self.store.history = [
+                item for item in self.store.history if item.draft_id != draft_id or item.action != "publish"
+            ]
+            raise
+        return entry
+
+    def withdraw_publish(
+        self, history_id: str, *, note: str | None = None
+    ) -> HistoryEntry:
+        """Reverse a recorded publish, keeping the full history intact.
+
+        Edges the publish activated are soft-deleted again and edges it
+        deactivated are restored, inside one atomic save. Both the original
+        publish entry and this withdraw entry (with its own graph snapshot)
+        stay in the history log forever.
+        """
+
+        original = next(
+            (item for item in self.store.history if item.id == history_id), None
+        )
+        if original is None:
+            raise NotFoundError(f"history entry '{history_id}' does not exist")
+        if original.action != "publish":
+            raise ValidationError(f"history entry '{history_id}' is not a publish")
+        already = next(
+            (
+                item
+                for item in self.store.history
+                if item.action == "withdraw" and item.draft_id == original.draft_id
+                and item.note == f"withdraw:{original.id}"
+            ),
+            None,
+        )
+        if already is not None:
+            raise ValidationError(f"publish '{history_id}' was already withdrawn")
+
+        backup_transforms = dict(self.store.transforms)
+        backup_contributions = {
+            key: Contribution(**item.to_dict())
+            for key, item in self.store.contributions.items()
+        }
+        backup_revision = self.store.revision
+        try:
+            for edge_id in original.activated:
+                edge = self.store.contributions.get(edge_id)
+                if edge is not None:
+                    edge.active = False
+            for edge_id in original.deactivated:
+                edge = self.store.contributions.get(edge_id)
+                if edge is not None:
+                    edge.active = True
+            for transform_id in original.created_transforms:
+                transform = self.store.transforms.get(transform_id)
+                if transform is not None:
+                    transform.active = False
+            self.store.revision += 1
+            entry = HistoryEntry(
+                id=f"history:r{self.store.revision}:withdraw:{original.draft_id}",
+                revision=self.store.revision,
+                action="withdraw",
+                draft_id=original.draft_id,
+                note=f"withdraw:{original.id}" if note is None else note,
+                activated=list(original.deactivated),
+                deactivated=list(original.activated),
+                snapshot=self._graph_snapshot(),
+            )
+            self.store.history.append(entry)
+            self.store.save()
+        except Exception:
+            self.store.transforms = backup_transforms
+            self.store.contributions = backup_contributions
+            self.store.revision = backup_revision
+            raise
+        return entry
+
+    def history(self) -> list[HistoryEntry]:
+        return list(self.store.history)
+
+    def _effective_edges(self) -> dict[str, Contribution]:
+        edges: dict[str, Contribution] = {}
+        for edge in self.store.contributions.values():
+            if not edge.active:
+                continue
+            transform = self.store.transforms.get(edge.transform_id)
+            if transform is None or not transform.active:
+                continue
+            if (
+                edge.source_field_id not in self.store.fields
+                or edge.target_field_id not in self.store.fields
+            ):
+                continue
+            edges[edge.id] = edge
+        return edges
+
+    def _graph_snapshot(self) -> dict[str, Any]:
+        return {
+            "revision": self.store.revision,
+            "objects": [item.to_dict() for item in self.store.objects.values()],
+            "fields": [item.to_dict() for item in self.store.fields.values()],
+            "transforms": [
+                item.to_dict() for item in self.store.transforms.values()
+            ],
+            "contributions": [
+                item.to_dict() for item in self.store.contributions.values()
+            ],
+        }
+
+    def _graph_cycles(self, edges: Iterable[Contribution]) -> list[list[str]]:
+        adjacency: dict[str, list[str]] = defaultdict(list)
+        for edge in edges:
+            adjacency[edge.source_field_id].append(edge.target_field_id)
+        color: dict[str, str] = {}
+        stack: list[str] = []
+        cycles: list[list[str]] = []
+        seen: set[tuple[str, ...]] = set()
+
+        def visit(node_id: str) -> None:
+            color[node_id] = "gray"
+            stack.append(node_id)
+            for child_id in adjacency[node_id]:
+                if color.get(child_id) == "gray":
+                    cycle_nodes = stack[stack.index(child_id):]
+                    normalized = tuple(self._normalize_cycle(cycle_nodes))
+                    if normalized not in seen:
+                        seen.add(normalized)
+                        cycles.append([*cycle_nodes, child_id])
+                elif color.get(child_id) != "black":
+                    visit(child_id)
+            stack.pop()
+            color[node_id] = "black"
+
+        for node_id in list(adjacency):
+            if color.get(node_id) is None:
+                visit(node_id)
+        return cycles
+
+    def _require_draft(self, draft_id: str) -> DraftProposal:
+        try:
+            return self.store.drafts[draft_id]
+        except KeyError:
+            raise NotFoundError(f"draft '{draft_id}' does not exist") from None
+
+
+@dataclass(slots=True)
+class DraftDiff:
+    """Impact difference between the effective graph and a draft proposal."""
+
+    draft_id: str
+    base_revision: int
+    current_revision: int
+    stale: bool
+    added_dependencies: list[dict[str, Any]]
+    removed_dependencies: list[dict[str, Any]]
+    lost_sources: dict[str, list[str]]
+    new_cycles: list[list[str]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "draft_id": self.draft_id,
+            "base_revision": self.base_revision,
+            "current_revision": self.current_revision,
+            "stale": self.stale,
+            "added_dependencies": self.added_dependencies,
+            "removed_dependencies": self.removed_dependencies,
+            "lost_sources": self.lost_sources,
+            "new_cycles": self.new_cycles,
+        }
