@@ -178,6 +178,18 @@ class LineageService:
         self.store.save()
         return contribution
 
+    def _check_mapping_fields(self, source_field_id: str, target_field_id: str) -> None:
+        if source_field_id not in self.store.fields:
+            raise NotFoundError(f"source field '{source_field_id}' does not exist")
+        if target_field_id not in self.store.fields:
+            raise NotFoundError(f"target field '{target_field_id}' does not exist")
+        if source_field_id == target_field_id:
+            raise ValidationError("a field cannot contribute to itself")
+
+    @staticmethod
+    def _contribution_id(transform_id: str, source_field_id: str, target_field_id: str) -> str:
+        return f"contrib:{transform_id}:{source_field_id}->{target_field_id}"
+
     def submit_transform(
         self,
         transform_id: str,
@@ -190,39 +202,163 @@ class LineageService:
         transform_metadata: dict[str, Any] | None = None,
         exist_ok: bool = False,
     ) -> list[Contribution]:
-        """Create one transform and all of its source-to-target edges atomically."""
+        """Create one transform and all of its source-to-target edges atomically.
+
+        Every mapping is validated before anything is mutated, and the whole
+        batch is persisted with a single save. If validation or persistence
+        fails, neither memory nor disk keeps any part of the batch.
+        """
 
         mappings = list(mappings)
         if not mappings:
             raise ValidationError("a transform must contribute at least one mapping")
-        self.create_transform(
-            transform_id,
-            name,
-            version,
-            code_ref=code_ref,
-            description=description,
-            metadata=transform_metadata,
-            exist_ok=exist_ok,
-        )
-        added: list[Contribution] = []
-        try:
-            for source_id, target_id, expression in mappings:
-                added.append(
-                    self.add_contribution(
-                        source_id,
-                        target_id,
-                        transform_id,
-                        expression=expression,
-                        exist_ok=exist_ok,
-                    )
+        transform = self.store.transforms.get(transform_id)
+        transform_created = transform is None
+        if transform_created:
+            transform = TransformVersion(
+                id=transform_id,
+                name=name,
+                version=version,
+                code_ref=code_ref,
+                description=description,
+                metadata=transform_metadata or {},
+            )
+        elif not exist_ok:
+            raise AlreadyExistsError(f"transform '{transform_id}' already exists")
+
+        planned: list[Contribution] = []
+        reused: list[Contribution] = []
+        planned_keys: set[tuple[str, str]] = set()
+        for source_id, target_id, expression in mappings:
+            self._check_mapping_fields(source_id, target_id)
+            key = (source_id, target_id)
+            if key in planned_keys:
+                if not exist_ok:
+                    raise AlreadyExistsError("identical contribution already exists")
+                continue
+            planned_keys.add(key)
+            contribution_id = self._contribution_id(transform_id, source_id, target_id)
+            existing = self.store.contributions.get(contribution_id)
+            if existing is not None:
+                if not exist_ok:
+                    raise AlreadyExistsError("identical contribution already exists")
+                reused.append(existing)
+                continue
+            planned.append(
+                Contribution(
+                    id=contribution_id,
+                    transform_id=transform_id,
+                    source_field_id=source_id,
+                    target_field_id=target_id,
+                    expression=expression,
                 )
+            )
+
+        added_ids = [contribution.id for contribution in planned]
+        try:
+            if transform_created:
+                self.store.transforms[transform_id] = transform
+            for contribution in planned:
+                self.store.contributions[contribution.id] = contribution
+            self.store.save()
         except Exception:
-            for contribution in added:
-                self.store.contributions.pop(contribution.id, None)
-            if not exist_ok:
+            for contribution_id in added_ids:
+                self.store.contributions.pop(contribution_id, None)
+            if transform_created:
                 self.store.transforms.pop(transform_id, None)
             raise
-        return added
+        return [*reused, *planned]
+
+    def replace_transform(
+        self,
+        transform_id: str,
+        mappings: Iterable[tuple[str, str, str | None]],
+    ) -> list[Contribution]:
+        """Atomically replace the active contribution set of one transform.
+
+        Old contributions not present in the new set are soft-deleted, matching
+        existing ones are reactivated with their new expression, and new edges
+        are added, all within a single save. Old and new contributions never
+        appear mixed in one persisted version; on failure every change is
+        rolled back in memory so memory and disk stay consistent.
+        """
+
+        transform = self.store.transforms.get(transform_id)
+        if transform is None:
+            raise NotFoundError(f"transform '{transform_id}' does not exist")
+        mappings = list(mappings)
+        if not mappings:
+            raise ValidationError("a transform must contribute at least one mapping")
+
+        keep_ids: list[str] = []
+        keep_set: set[str] = set()
+        to_add: list[Contribution] = []
+        to_update: list[tuple[Contribution, str | None]] = []
+        planned_keys: set[tuple[str, str]] = set()
+        for source_id, target_id, expression in mappings:
+            self._check_mapping_fields(source_id, target_id)
+            key = (source_id, target_id)
+            if key in planned_keys:
+                raise AlreadyExistsError("identical contribution already exists")
+            planned_keys.add(key)
+            contribution_id = self._contribution_id(transform_id, source_id, target_id)
+            existing = self.store.contributions.get(contribution_id)
+            if existing is not None:
+                to_update.append((existing, expression))
+            else:
+                to_add.append(
+                    Contribution(
+                        id=contribution_id,
+                        transform_id=transform_id,
+                        source_field_id=source_id,
+                        target_field_id=target_id,
+                        expression=expression,
+                    )
+                )
+            keep_ids.append(contribution_id)
+            keep_set.add(contribution_id)
+
+        to_deactivate = [
+            contribution
+            for contribution in self.store.contributions.values()
+            if contribution.transform_id == transform_id
+            and contribution.active
+            and contribution.id not in keep_set
+        ]
+
+        saved_states = {
+            contribution.id: (contribution.active, contribution.expression)
+            for contribution in to_deactivate
+        }
+        saved_states.update(
+            {
+                contribution.id: (contribution.active, contribution.expression)
+                for contribution, _ in to_update
+            }
+        )
+        transform_was_active = transform.active
+        added_ids = [contribution.id for contribution in to_add]
+        try:
+            for contribution in to_deactivate:
+                contribution.active = False
+            for contribution, expression in to_update:
+                contribution.active = True
+                contribution.expression = expression
+            for contribution in to_add:
+                self.store.contributions[contribution.id] = contribution
+            transform.active = True
+            self.store.save()
+        except Exception:
+            for contribution_id in added_ids:
+                self.store.contributions.pop(contribution_id, None)
+            for contribution_id, (active, expression) in saved_states.items():
+                contribution = self.store.contributions.get(contribution_id)
+                if contribution is not None:
+                    contribution.active = active
+                    contribution.expression = expression
+            transform.active = transform_was_active
+            raise
+        return [self.store.contributions[contribution_id] for contribution_id in keep_ids]
 
     def delete_transform(self, transform_id: str) -> list[str]:
         """Withdraw only edges contributed by one transform version."""
@@ -238,7 +374,13 @@ class LineageService:
         for contribution_id in affected:
             self.store.contributions[contribution_id].active = False
         transform.active = False
-        self.store.save()
+        try:
+            self.store.save()
+        except Exception:
+            for contribution_id in affected:
+                self.store.contributions[contribution_id].active = True
+            transform.active = True
+            raise
         return affected
 
     def restore_transform(self, transform_id: str) -> list[str]:
@@ -253,7 +395,13 @@ class LineageService:
         for contribution_id in affected:
             self.store.contributions[contribution_id].active = True
         transform.active = True
-        self.store.save()
+        try:
+            self.store.save()
+        except Exception:
+            for contribution_id in affected:
+                self.store.contributions[contribution_id].active = False
+            transform.active = False
+            raise
         return affected
 
     def field_identity_report(self, field_id: str) -> dict[str, Any]:
@@ -305,7 +453,12 @@ class LineageService:
             if not edge.active:
                 continue
             transform = self.store.transforms.get(edge.transform_id)
-            if transform is not None and not transform.active:
+            if transform is None or not transform.active:
+                continue
+            if (
+                edge.source_field_id not in self.store.fields
+                or edge.target_field_id not in self.store.fields
+            ):
                 continue
             adjacency[incoming_key(edge)].append(edge)
             active_edges[edge.id] = edge

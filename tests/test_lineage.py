@@ -1,8 +1,9 @@
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
-from lineage import AlreadyExistsError, JsonLineageStore, LineageService
+from lineage import AlreadyExistsError, JsonLineageStore, LineageService, NotFoundError
 
 
 class LineageServiceTest(unittest.TestCase):
@@ -147,6 +148,150 @@ class LineageServiceTest(unittest.TestCase):
             self.service.create_field("a.v1.x", "a.v1", "x")
         with self.assertRaises(AlreadyExistsError):
             self.service.create_field("a.v1.x2", "a.v1", "x")
+
+    def _small_graph(self):
+        self.object("a.v1", "a", "v1")
+        self.object("b.v1", "b", "v1")
+        self.object("c.v1", "c", "v1")
+        self.field("a.v1.x", "a.v1", "x")
+        self.field("b.v1.x", "b.v1", "x")
+        self.field("c.v1.x", "c.v1", "x")
+
+    def test_failed_submit_persists_nothing_after_reload(self):
+        self._small_graph()
+        with self.assertRaises(NotFoundError):
+            self.service.submit_transform(
+                "t.bad",
+                "bad",
+                "1",
+                [
+                    ("a.v1.x", "c.v1.x", "ok"),
+                    ("missing.field", "c.v1.x", "broken"),
+                ],
+            )
+        self.assertEqual(self.service.store.contributions, {})
+        self.assertNotIn("t.bad", self.service.store.transforms)
+
+        reloaded = LineageService(JsonLineageStore(self.service.store.path))
+        self.assertEqual(reloaded.store.contributions, {})
+        self.assertNotIn("t.bad", reloaded.store.transforms)
+        self.assertEqual(reloaded.impact("a.v1.x").direct, {})
+
+    def test_duplicate_submit_with_exist_ok_is_idempotent(self):
+        self._small_graph()
+        mappings = [("a.v1.x", "c.v1.x", "a"), ("b.v1.x", "c.v1.x", "b")]
+        first = self.service.submit_transform("t.dup", "dup", "1", mappings)
+        second = self.service.submit_transform(
+            "t.dup", "dup", "1", mappings, exist_ok=True
+        )
+        self.assertEqual([c.id for c in first], [c.id for c in second])
+        self.assertEqual(len(self.service.store.contributions), 2)
+        with self.assertRaises(AlreadyExistsError):
+            self.service.submit_transform("t.dup", "dup", "1", mappings)
+        reloaded = LineageService(JsonLineageStore(self.service.store.path))
+        self.assertEqual(len(reloaded.store.contributions), 2)
+        self.assertEqual(
+            set(reloaded.upstream("c.v1.x").direct), {"a.v1.x", "b.v1.x"}
+        )
+
+    def test_save_interruption_rolls_back_memory_and_disk(self):
+        self._small_graph()
+        self.service.submit_transform(
+            "t.keep", "keep", "1", [("a.v1.x", "c.v1.x", "a")]
+        )
+        with mock.patch.object(
+            self.service.store, "save", side_effect=OSError("disk full")
+        ):
+            with self.assertRaises(OSError):
+                self.service.submit_transform(
+                    "t.fail",
+                    "fail",
+                    "1",
+                    [("b.v1.x", "c.v1.x", "b")],
+                )
+        self.assertNotIn("t.fail", self.service.store.transforms)
+        self.assertEqual(
+            set(self.service.upstream("c.v1.x").direct), {"a.v1.x"}
+        )
+        reloaded = LineageService(JsonLineageStore(self.service.store.path))
+        self.assertNotIn("t.fail", reloaded.store.transforms)
+        self.assertEqual(set(reloaded.upstream("c.v1.x").direct), {"a.v1.x"})
+
+    def test_replace_transform_swaps_contributions_atomically(self):
+        self._small_graph()
+        self.service.submit_transform(
+            "t.swap",
+            "swap",
+            "1",
+            [("a.v1.x", "c.v1.x", "a"), ("b.v1.x", "c.v1.x", "b")],
+        )
+        active = self.service.replace_transform(
+            "t.swap", [("b.v1.x", "c.v1.x", "b2")]
+        )
+        self.assertEqual([c.id for c in active], ["contrib:t.swap:b.v1.x->c.v1.x"])
+        old = self.service.store.contributions["contrib:t.swap:a.v1.x->c.v1.x"]
+        self.assertFalse(old.active)
+        kept = self.service.store.contributions["contrib:t.swap:b.v1.x->c.v1.x"]
+        self.assertTrue(kept.active)
+        self.assertEqual(kept.expression, "b2")
+
+        reloaded = LineageService(JsonLineageStore(self.service.store.path))
+        self.assertEqual(set(reloaded.upstream("c.v1.x").direct), {"b.v1.x"})
+        evidence = next(iter(reloaded.upstream("c.v1.x").edges.values()))
+        self.assertEqual(evidence.expression, "b2")
+
+    def test_replace_transform_failure_keeps_previous_version(self):
+        self._small_graph()
+        self.service.submit_transform(
+            "t.swap2", "swap2", "1", [("a.v1.x", "c.v1.x", "a")]
+        )
+        with mock.patch.object(
+            self.service.store, "save", side_effect=OSError("disk full")
+        ):
+            with self.assertRaises(OSError):
+                self.service.replace_transform(
+                    "t.swap2", [("b.v1.x", "c.v1.x", "b")]
+                )
+        self.assertEqual(set(self.service.upstream("c.v1.x").direct), {"a.v1.x"})
+        reloaded = LineageService(JsonLineageStore(self.service.store.path))
+        self.assertEqual(set(reloaded.upstream("c.v1.x").direct), {"a.v1.x"})
+
+    def test_dangling_references_are_excluded_from_queries(self):
+        self._small_graph()
+        self.service.submit_transform(
+            "t.dangle",
+            "dangle",
+            "1",
+            [("a.v1.x", "c.v1.x", "a"), ("b.v1.x", "c.v1.x", "b")],
+        )
+        del self.service.store.fields["b.v1.x"]
+        self.service.store.transforms.pop("t.ghost", None)
+        self.service.store.contributions["contrib:ghost:a.v1.x->c.v1.x"] = (
+            self.service.store.contributions["contrib:t.dangle:a.v1.x->c.v1.x"]
+        )
+        result = self.service.upstream("c.v1.x")
+        self.assertEqual(set(result.direct), {"a.v1.x"})
+        self.assertEqual(
+            {edge.transform_id for edge in result.edges.values()}, {"t.dangle"}
+        )
+
+    def test_cycle_traversal_terminates_after_failed_submit(self):
+        self._small_graph()
+        self.service.submit_transform(
+            "t.c1", "c1", "1", [("a.v1.x", "b.v1.x", "ab")]
+        )
+        self.service.submit_transform(
+            "t.c2", "c2", "1", [("b.v1.x", "a.v1.x", "ba")]
+        )
+        with self.assertRaises(NotFoundError):
+            self.service.submit_transform(
+                "t.c3", "c3", "1", [("a.v1.x", "nope", "x")]
+            )
+        result = self.service.impact("a.v1.x")
+        self.assertEqual(set(result.direct), {"b.v1.x"})
+        self.assertTrue(result.cycles)
+        reloaded = LineageService(JsonLineageStore(self.service.store.path))
+        self.assertEqual(set(reloaded.impact("a.v1.x").direct), {"b.v1.x"})
 
 
 if __name__ == "__main__":
