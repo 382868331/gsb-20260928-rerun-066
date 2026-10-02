@@ -11,6 +11,7 @@ from .models import (
     DraftProposal,
     Field,
     HistoryEntry,
+    MergeSession,
     TransformVersion,
 )
 
@@ -29,6 +30,7 @@ class JsonLineageStore:
         self.transforms: dict[str, TransformVersion] = {}
         self.contributions: dict[str, Contribution] = {}
         self.drafts: dict[str, DraftProposal] = {}
+        self.merges: dict[str, MergeSession] = {}
         self.history: list[HistoryEntry] = []
         self.revision: int = 0
         if self.path.exists():
@@ -57,6 +59,10 @@ class JsonLineageStore:
             item["id"]: DraftProposal.from_dict(item)
             for item in raw.get("drafts", [])
         }
+        self.merges = {
+            item["id"]: MergeSession.from_dict(item)
+            for item in raw.get("merges", [])
+        }
         self.history = [
             HistoryEntry.from_dict(item) for item in raw.get("history", [])
         ]
@@ -72,6 +78,7 @@ class JsonLineageStore:
                 item.to_dict() for item in self.contributions.values()
             ],
             "drafts": [item.to_dict() for item in self.drafts.values()],
+            "merges": [item.to_dict() for item in self.merges.values()],
             "history": [item.to_dict() for item in self.history],
             "revision": self.revision,
         }

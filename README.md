@@ -26,6 +26,12 @@
 - 基线核对：每个草稿记录 `base_revision`；两个草稿基于同一旧版先后提交时，后一份发布会抛出 `StaleBaselineError`，需用户重新确认（`confirm_stale=True`）后才落盘，不会静默覆盖先发布的成果。
 - 历史快照：每次发布与撤回都追加一条 `HistoryEntry`，内含发布前完整图快照；批量校验失败或保存中断时内存与磁盘整体回滚，历史图保持完整。
 - 发布撤回：`withdraw_publish(history_id)` 软删除该次发布启用的边并恢复其停用的边，撤回本身也作为历史条目永久保留。
+- 字段软删除：`delete_field` / `remove_field_from_draft` 只把字段标记为 `active=false`，证据边与历史保留；发布含字段删除的草稿时一并落盘，撤回时恢复。
+- 两稿合并：`start_merge` 打开一个可持久化的合并会话，把两份已分别审查的草稿合成一份待发布方案；不同来源的修改共同保留。
+- 冲突裁决：一方删除字段而另一方仍引用（`field_removed`）、一方删除映射而另一方保留（`mapping_dropped`）、双方替换同一映射且表达式不同（`mapping_replaced`）都会生成带影响链的冲突，必须由用户在 `left` / `right` / `drop` / `keep_baseline` 中显式选择，绝不按提交先后覆盖。
+- 反复预览：`resolve_merge_conflict` 可逐个裁决，`merge_preview` 可任意次重算；尚未决定的部分不进入模拟图，已决定内容重开存储后也不丢失。预览会连同两边原修改一起解释新增依赖（带来源 `origin`）、新增循环、失去来源的目标与彻底无来源结果。
+- 基线再确认：合并进行中基线推进时，`merge_preview` 标记 `baseline_moved`，依赖基线的已决冲突被置为 `needs_reconfirm`；与基线无关的决定继续保留，完成合并需重新确认受影响项并以 `confirm_stale=True` 落盘。
+- 合并隔离：`complete_merge` 只产出新的待发布草稿（记录 `sources` 两边来源），`abandon_merge` 放弃会话；两份原草稿、审查依据和正式历史在保存重开后均保持完整。
 
 ## Python API
 
@@ -90,6 +96,45 @@ service.withdraw_publish(entry.id)
 service.history()
 ```
 
+### 合并两份已审查草稿
+
+见下文“两稿合并”说明：`start_merge` 打开可保存重开的合并会话，`merge_conflicts` / `merge_preview` 查看带影响链的冲突与循环、无来源结果，`resolve_merge_conflict` 逐个裁决，`complete_merge` 在全部冲突解决后产出新的待发布草稿，`abandon_merge` 放弃且不影响原草稿与历史。基线推进后只有依赖基线的决定需要重新确认（`needs_reconfirm`），其他选择保留。
+
+```python
+# 两份草稿可以分别删除字段、替换同一映射，或补充不同来源
+service.create_draft("draft.a", "方案 A")
+service.stage_transform(
+    "draft.a", "transforms.segment.v2", "build_segment", "2.0.0",
+    [("customers.v2.tier", "enriched.v1.segment", "coalesce(tier)")],
+)
+service.create_draft("draft.b", "方案 B")
+service.remove_field_from_draft("draft.b", "orders.v1.region")
+
+# 打开持久化合并会话；冲突带影响链（上下游路径、引用位置）
+session = service.start_merge("merge.1", "draft.a", "draft.b", name="A+B")
+for conflict in service.merge_conflicts("merge.1"):
+    print(conflict.id, conflict.kind, conflict.options, conflict.impact_chain)
+
+# 可逐个解决并反复预览；未决部分不会出现在预览的有效图中
+service.resolve_merge_conflict("merge.1", "field:orders.v1.region", "left")
+preview = service.merge_preview("merge.1")
+print(preview.baseline_moved)
+print(preview.added_dependencies)   # 每条带来源 origin: draft.a / draft.b / both
+print(preview.new_cycles)
+print(preview.source_less_results)
+print(preview.unresolved_conflicts)
+
+# 全部冲突解决后生成新的待发布草稿；基线变化时先重认 needs_reconfirm 冲突
+merged = service.complete_merge(
+    "merge.1", "draft.merged", name="A+B", confirm_stale=True
+)
+service.publish_draft("draft.merged")
+
+# 放弃合并不影响原草稿、审查依据与正式历史
+service.abandon_merge("merge.1")
+```
+
+
 建议由提交方生成稳定、可读且全局唯一的 ID，例如：
 
 - 对象：`database.schema.table.version`，如 `dw.dim_customer.v20260929`。
@@ -116,13 +161,20 @@ python -m lineage.cli --store lineage.json draft-diff d1
 python -m lineage.cli --store lineage.json publish-draft d1 --confirm-stale --note 'merge tier'
 python -m lineage.cli --store lineage.json withdraw-publish history:r1:publish:d1
 python -m lineage.cli --store lineage.json history
+python -m lineage.cli --store lineage.json remove-field-draft d1 orders.v1.region
+python -m lineage.cli --store lineage.json merge-start m1 d1 d2 --name 'd1+d2'
+python -m lineage.cli --store lineage.json merge-conflicts m1
+python -m lineage.cli --store lineage.json merge-resolve m1 field:orders.v1.region left
+python -m lineage.cli --store lineage.json merge-preview m1
+python -m lineage.cli --store lineage.json merge-complete m1 draft.merged --confirm-stale
+python -m lineage.cli --store lineage.json merge-abandon m1
 ```
 
 安装为包后也可以使用 `lineage --store lineage.json ...`。
 
 ## 持久化格式
 
-JSON 文件包含 `objects`、`fields`、`transforms`、`contributions` 四个图集合，以及 `drafts`（草稿方案）、`history`（含完整图快照的发布/撤回记录）和 `revision`（基线版本号）。保存采用临时文件加原子替换，适合当前单机、低频提交的工具集成场景。其他处理工具可以直接复用 `LineageService` 提交同构关系；后续也可以把 `JsonLineageStore` 替换成数据库仓储，而保持服务接口不变。
+JSON 文件包含 `objects`、`fields`（含软删除 `active` 标记）、`transforms`、`contributions` 四个图集合，以及 `drafts`（草稿方案、字段删除与来源记录）、`merges`（合并会话、冲突与已做决定）、`history`（含完整图快照的发布/撤回记录）和 `revision`（基线版本号）。保存采用临时文件加原子替换，适合当前单机、低频提交的工具集成场景。其他处理工具可以直接复用 `LineageService` 提交同构关系；后续也可以把 `JsonLineageStore` 替换成数据库仓储，而保持服务接口不变。
 
 ## 测试
 

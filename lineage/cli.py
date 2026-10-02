@@ -159,6 +159,39 @@ def build_parser() -> argparse.ArgumentParser:
     discard = subparsers.add_parser("discard-draft")
     discard.add_argument("draft_id")
 
+    remove_field = subparsers.add_parser("remove-field-draft")
+    remove_field.add_argument("draft_id")
+    remove_field.add_argument("field_id")
+
+    merge_start = subparsers.add_parser("merge-start")
+    merge_start.add_argument("merge_id")
+    merge_start.add_argument("left_draft_id")
+    merge_start.add_argument("right_draft_id")
+    merge_start.add_argument("--name")
+
+    merge_conflicts = subparsers.add_parser("merge-conflicts")
+    merge_conflicts.add_argument("merge_id")
+
+    merge_resolve = subparsers.add_parser("merge-resolve")
+    merge_resolve.add_argument("merge_id")
+    merge_resolve.add_argument("conflict_id")
+    merge_resolve.add_argument(
+        "decision",
+        help="left | right | drop | keep_baseline (per conflict options)",
+    )
+
+    merge_preview = subparsers.add_parser("merge-preview")
+    merge_preview.add_argument("merge_id")
+
+    merge_complete = subparsers.add_parser("merge-complete")
+    merge_complete.add_argument("merge_id")
+    merge_complete.add_argument("result_draft_id")
+    merge_complete.add_argument("--name")
+    merge_complete.add_argument("--confirm-stale", action="store_true")
+
+    merge_abandon = subparsers.add_parser("merge-abandon")
+    merge_abandon.add_argument("merge_id")
+
     withdraw = subparsers.add_parser("withdraw-publish")
     withdraw.add_argument("history_id")
     withdraw.add_argument("--note")
@@ -166,7 +199,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("history")
 
     list_items = subparsers.add_parser("list")
-    list_items.add_argument("kind", choices=["objects", "fields", "transforms", "contributions", "drafts"])
+    list_items.add_argument("kind", choices=["objects", "fields", "transforms", "contributions", "drafts", "merges"])
+    delete_field = subparsers.add_parser("delete-field")
+    delete_field.add_argument("field_id")
+
+    restore_field = subparsers.add_parser("restore-field")
+    restore_field.add_argument("field_id")
     return parser
 
 
@@ -265,6 +303,53 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "discard-draft":
         print(json.dumps(service.discard_draft(args.draft_id).to_dict(), ensure_ascii=False, indent=2))
         return
+    elif args.command == "remove-field-draft":
+        result = service.remove_field_from_draft(args.draft_id, args.field_id)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "merge-start":
+        result = service.start_merge(
+            args.merge_id,
+            args.left_draft_id,
+            args.right_draft_id,
+            name=args.name,
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "merge-conflicts":
+        conflicts = service.merge_conflicts(args.merge_id)
+        print(json.dumps([c.to_dict() for c in conflicts], ensure_ascii=False, indent=2))
+        return
+    elif args.command == "merge-resolve":
+        result = service.resolve_merge_conflict(
+            args.merge_id, args.conflict_id, args.decision
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "merge-preview":
+        print(json.dumps(service.merge_preview(args.merge_id).to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "merge-complete":
+        result = service.complete_merge(
+            args.merge_id,
+            args.result_draft_id,
+            name=args.name,
+            confirm_stale=args.confirm_stale,
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "merge-abandon":
+        result = service.abandon_merge(args.merge_id)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "delete-field":
+        result = service.delete_field(args.field_id)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "restore-field":
+        result = service.restore_field(args.field_id)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
     elif args.command == "withdraw-publish":
         print(json.dumps(service.withdraw_publish(args.history_id, note=args.note).to_dict(), ensure_ascii=False, indent=2))
         return
@@ -280,6 +365,8 @@ def main(argv: list[str] | None = None) -> None:
             payload = [_transform_dict(x) for x in service.store.transforms.values()]
         elif args.kind == "drafts":
             payload = [x.to_dict() for x in service.store.drafts.values()]
+        elif args.kind == "merges":
+            payload = [x.to_dict() for x in service.store.merges.values()]
         else:
             payload = [_contribution_dict(service, x) for x in service.store.contributions.values()]
         print(json.dumps(payload, ensure_ascii=False, indent=2))
