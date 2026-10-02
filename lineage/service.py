@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
+import hashlib
 from typing import Any, Iterable
 
 from .exceptions import (
@@ -17,6 +18,9 @@ from .models import (
     DraftProposal,
     Field,
     HistoryEntry,
+    MergeConflict,
+    MergeDecision,
+    MergeSession,
     TransformVersion,
 )
 from .store import JsonLineageStore
@@ -192,10 +196,14 @@ class LineageService:
         return contribution
 
     def _check_mapping_fields(self, source_field_id: str, target_field_id: str) -> None:
-        if source_field_id not in self.store.fields:
+        source = self.store.fields.get(source_field_id)
+        target = self.store.fields.get(target_field_id)
+        if source is None:
             raise NotFoundError(f"source field '{source_field_id}' does not exist")
-        if target_field_id not in self.store.fields:
+        if target is None:
             raise NotFoundError(f"target field '{target_field_id}' does not exist")
+        if not source.active or not target.active:
+            raise ValidationError("cannot map to a deleted field")
         if source_field_id == target_field_id:
             raise ValidationError("a field cannot contribute to itself")
 
@@ -468,10 +476,9 @@ class LineageService:
             transform = self.store.transforms.get(edge.transform_id)
             if transform is None or not transform.active:
                 continue
-            if (
-                edge.source_field_id not in self.store.fields
-                or edge.target_field_id not in self.store.fields
-            ):
+            source = self.store.fields.get(edge.source_field_id)
+            target = self.store.fields.get(edge.target_field_id)
+            if source is None or target is None or not source.active or not target.active:
                 continue
             adjacency[incoming_key(edge)].append(edge)
             active_edges[edge.id] = edge
@@ -652,6 +659,18 @@ class LineageService:
         self.store.save()
         return draft
 
+    def stage_field_deletion(self, draft_id: str, field_id: str) -> DraftProposal:
+        """Stage a soft field deletion without touching the effective graph."""
+
+        draft = self._require_draft(draft_id)
+        if draft.status != "open":
+            raise ValidationError(f"draft '{draft_id}' is {draft.status}")
+        self._require_field(field_id)
+        if field_id not in draft.deleted_fields:
+            draft.deleted_fields.append(field_id)
+        self.store.save()
+        return draft
+
     def discard_draft(self, draft_id: str) -> DraftProposal:
         draft = self._require_draft(draft_id)
         if draft.status != "open":
@@ -659,6 +678,729 @@ class LineageService:
         draft.status = "discarded"
         self.store.save()
         return draft
+
+    def begin_merge(
+        self, session_id: str, output_draft_id: str, left_draft_id: str, right_draft_id: str
+    ) -> MergePreview:
+        if session_id in self.store.merge_sessions:
+            raise AlreadyExistsError(f"merge session '{session_id}' already exists")
+        if output_draft_id in self.store.drafts:
+            raise AlreadyExistsError(f"draft '{output_draft_id}' already exists")
+        if left_draft_id == right_draft_id:
+            raise ValidationError("cannot merge a draft with itself")
+        left = self._require_open_reviewed_draft(left_draft_id)
+        right = self._require_open_reviewed_draft(right_draft_id)
+        output = DraftProposal(
+            id=output_draft_id,
+            name=f"Merge {left_draft_id} + {right_draft_id}",
+            base_revision=self.store.revision,
+            metadata={
+                "merge_session_id": session_id,
+                "source_draft_ids": [left_draft_id, right_draft_id],
+                "pending": True,
+            },
+        )
+        session = MergeSession(
+            id=session_id,
+            output_draft_id=output_draft_id,
+            draft_ids=[left_draft_id, right_draft_id],
+            base_revision=self.store.revision,
+        )
+        self.store.drafts[output.id] = output
+        self.store.merge_sessions[session.id] = session
+        self.store.save()
+        return self.preview_merge(session_id)
+
+    def _require_open_reviewed_draft(self, draft_id: str) -> DraftProposal:
+        draft = self._require_draft(draft_id)
+        if draft.status != "open":
+            raise ValidationError(f"draft '{draft_id}' is {draft.status}")
+        return draft
+
+    def _require_merge_session(self, session_id: str) -> MergeSession:
+        try:
+            session = self.store.merge_sessions[session_id]
+        except KeyError:
+            raise NotFoundError(
+                f"merge session '{session_id}' does not exist"
+            ) from None
+        if session.status != "open":
+            raise ValidationError(f"merge session '{session_id}' is {session.status}")
+        return session
+
+    def resolve_merge_conflict(
+        self, session_id: str, conflict_id: str, choice: str
+    ) -> MergePreview:
+        session = self._require_merge_session(session_id)
+        preview = self._build_merge_preview(session)
+        conflict_data = next(
+            (item for item in preview.conflicts if item["id"] == conflict_id), None
+        )
+        conflict = MergeConflict(**conflict_data) if conflict_data else None
+        if conflict is None:
+            raise NotFoundError(
+                f"merge conflict '{conflict_id}' does not require resolution"
+            )
+        if choice not in conflict.options:
+            raise ValidationError(
+                f"invalid choice '{choice}' for conflict '{conflict_id}'"
+            )
+        session.decisions = [
+            item for item in session.decisions if item.conflict_id != conflict_id
+        ]
+        session.decisions.append(
+            MergeDecision(
+                conflict_id=conflict_id,
+                choice=choice,
+                fingerprint=conflict.fingerprint,
+                confirmed_revision=self.store.revision,
+                baseline_signature=conflict.baseline_signature,
+            )
+        )
+        self.store.save()
+        return self.preview_merge(session_id)
+
+    def preview_merge(self, session_id: str) -> "MergePreview":
+        session = self._require_merge_session(session_id)
+        preview = self._build_merge_preview(session)
+        conflicts = [MergeConflict(**item) for item in preview.conflicts]
+        output = self._require_draft(session.output_draft_id)
+        combined, deleted = self._combined_merge_plan(
+            session,
+            conflicts,
+            unresolved_only=True,
+            active_conflicts=set(preview.unresolved_conflicts),
+        )
+        output.transforms = list(combined)
+        output.deleted_fields = sorted(deleted)
+        output.metadata["pending"] = bool(preview.unresolved_conflicts)
+        self.store.save()
+        return preview
+
+    def abandon_merge(self, session_id: str) -> MergeSession:
+        session = self._require_merge_session(session_id)
+        session.status = "abandoned"
+        output = self.store.drafts.get(session.output_draft_id)
+        if output is not None and output.metadata.get("merge_session_id") == session_id:
+            output.status = "discarded"
+        self.store.save()
+        return session
+
+    def publish_merge(
+        self,
+        session_id: str,
+        *,
+        confirm_stale: bool = False,
+        note: str | None = None,
+    ) -> HistoryEntry:
+        preview = self.preview_merge(session_id)
+        if preview.unresolved_conflicts:
+            raise ValidationError("merge has unresolved conflicts")
+        if preview.stale and not confirm_stale:
+            raise StaleBaselineError(
+                session_id, preview.base_revision, preview.current_revision
+            )
+        session = self.store.merge_sessions[session_id]
+        entry = self.publish_draft(
+            session.output_draft_id,
+            confirm_stale=confirm_stale,
+            note=note,
+        )
+        session.status = "published"
+        self.store.save()
+        return entry
+
+    def _build_merge_preview(self, session: MergeSession) -> "MergePreview":
+        left = self._require_open_reviewed_draft(session.draft_ids[0])
+        right = self._require_open_reviewed_draft(session.draft_ids[1])
+        current_edges = self._effective_edges()
+        current_cycles = {tuple(c) for c in self._graph_cycles(current_edges.values())}
+        current_conflicts = self._merge_conflicts(
+            session, left, right, current_edges
+        )
+        conflicts = current_conflicts
+        current_signatures = {
+            conflict.id: conflict.baseline_signature for conflict in conflicts
+        }
+        decision_by_id = {
+            decision.conflict_id: decision for decision in session.decisions
+        }
+        unresolved: list[MergeConflict] = []
+        reconfirm: list[str] = []
+        for conflict in conflicts:
+            decision = decision_by_id.get(conflict.id)
+            if decision is None or decision.fingerprint != conflict.fingerprint:
+                unresolved.append(conflict)
+                if decision is not None:
+                    reconfirm.append(conflict.id)
+                continue
+            if self.store.revision != decision.confirmed_revision:
+                affected = (
+                    current_signatures.get(conflict.id)
+                    != decision.baseline_signature
+                )
+                if affected:
+                    reconfirm.append(conflict.id)
+                    unresolved.append(conflict)
+
+        active_conflicts = set(item.id for item in unresolved)
+        combined, deleted = self._combined_merge_plan(
+            session, conflicts, unresolved_only=True, active_conflicts=active_conflicts
+        )
+        simulated, _ = self._simulate_changes(current_edges, deleted, combined)
+
+        added_keys, removed_keys = self._edge_set_difference(current_edges, simulated)
+        lost = self._lost_sources(current_edges, simulated, deleted)
+        new_cycles = [
+            cycle
+            for cycle in self._graph_cycles(simulated.values())
+            if tuple(cycle) not in current_cycles
+        ]
+        return MergePreview(
+            session_id=session.id,
+            output_draft_id=session.output_draft_id,
+            source_draft_ids=list(session.draft_ids),
+            base_revision=session.base_revision,
+            current_revision=self.store.revision,
+            stale=session.base_revision != self.store.revision,
+            conflicts=[item.to_dict() for item in conflicts],
+            unresolved_conflicts=[item.id for item in unresolved],
+            reconfirm_conflicts=reconfirm,
+            added_dependencies=[
+                {"transform_id": t, "source_field_id": s, "target_field_id": g}
+                for t, s, g in added_keys
+            ],
+            removed_dependencies=[
+                {"transform_id": t, "source_field_id": s, "target_field_id": g}
+                for t, s, g in removed_keys
+            ],
+            lost_sources=lost,
+            new_cycles=new_cycles,
+            explanations=self._merge_explanations(
+                left,
+                right,
+                conflicts,
+                session,
+                new_cycles,
+                lost,
+                added_keys,
+                removed_keys,
+            ),
+        )
+
+    def _merge_conflicts(
+        self,
+        session: MergeSession,
+        left: DraftProposal,
+        right: DraftProposal,
+        relevant_edges: dict[str, Contribution] | None = None,
+    ) -> list[MergeConflict]:
+        relevant_edges = relevant_edges or self._effective_edges()
+        conflicts: list[MergeConflict] = []
+        left_transforms = {item.transform_id: item for item in left.transforms}
+        right_transforms = {item.transform_id: item for item in right.transforms}
+        for transform_id in sorted(set(left_transforms) & set(right_transforms)):
+            left_item = left_transforms[transform_id]
+            right_item = right_transforms[transform_id]
+            left_maps = self._mapping_map(left_item)
+            right_maps = self._mapping_map(right_item)
+            for key in sorted(set(left_maps) & set(right_maps)):
+                left_mapping = left_maps[key]
+                right_mapping = right_maps[key]
+                if left_mapping.get("expression") == right_mapping.get("expression"):
+                    continue
+                conflicts.append(
+                    self._conflict(
+                        session,
+                        "same_mapping",
+                        f"mapping:{transform_id}:{key[0]}->{key[1]}",
+                        left=left,
+                        right=right,
+                        transform_id=transform_id,
+                        source_field_id=key[0],
+                        target_field_id=key[1],
+                        options={
+                            "left": left_mapping,
+                            "right": right_mapping,
+                        },
+                        relevant_edges=relevant_edges,
+                    )
+                )
+            if any(
+                getattr(left_item, name) != getattr(right_item, name)
+                for name in ("name", "version", "code_ref", "description")
+            ):
+                conflicts.append(
+                    self._conflict(
+                        session,
+                        "transform_metadata",
+                        f"metadata:{transform_id}",
+                        left=left,
+                        right=right,
+                        transform_id=transform_id,
+                        options={
+                            "left": self._draft_transform_identity(left_item),
+                            "right": self._draft_transform_identity(right_item),
+                        },
+                        relevant_edges=relevant_edges,
+                    )
+                )
+
+        left_deletes = set(left.deleted_fields)
+        right_deletes = set(right.deleted_fields)
+        references = self._draft_field_references([left, right])
+        for field_id in sorted((left_deletes | right_deletes) & set(references)):
+            deleting_side = "left" if field_id in left_deletes else "right"
+            referencing_side = "right" if deleting_side == "left" else "left"
+            opposite_draft_id = session.draft_ids[
+                {"left": 1, "right": 0}[deleting_side]
+            ]
+            opposite_refs = [
+                item
+                for item in references[field_id]
+                if item["draft_id"] == opposite_draft_id
+            ]
+            if not opposite_refs:
+                continue
+            options = {
+                "delete_field": {
+                    "deleted_by": session.draft_ids[{"left": 0, "right": 1}[deleting_side]],
+                    "removed_references": opposite_refs,
+                },
+                "keep_field": {
+                    "referenced_by": opposite_draft_id,
+                    "references": opposite_refs,
+                },
+            }
+            conflicts.append(
+                self._conflict(
+                    session,
+                    "deleted_field",
+                    f"deleted-field:{field_id}",
+                    left=left,
+                    right=right,
+                    field_id=field_id,
+                options=options,
+                relevant_edges=relevant_edges,
+            )
+            )
+        return conflicts
+
+    def _conflict(
+        self,
+        session: MergeSession,
+        conflict_type: str,
+        stable_id: str,
+        *,
+        left: DraftProposal,
+        right: DraftProposal,
+        transform_id: str | None = None,
+        source_field_id: str | None = None,
+        target_field_id: str | None = None,
+        field_id: str | None = None,
+        options: dict[str, Any],
+        relevant_edges: dict[str, Contribution] | None = None,
+    ) -> MergeConflict:
+        conflict_id = f"merge:{session.id}:{stable_id}"
+        material = {
+            "type": conflict_type,
+            "transform_id": transform_id,
+            "source_field_id": source_field_id,
+            "target_field_id": target_field_id,
+            "field_id": field_id,
+            "options": options,
+        }
+        fingerprint = hashlib.sha256(
+            repr(material).encode("utf-8")
+        ).hexdigest()
+        relevant_edges = relevant_edges or {}
+        baseline_material = sorted(
+            (
+                edge.transform_id,
+                edge.source_field_id,
+                edge.target_field_id,
+                edge.expression,
+            )
+            for edge in relevant_edges.values()
+            if edge.transform_id == transform_id
+            or edge.source_field_id in {source_field_id, field_id}
+            or edge.target_field_id in {target_field_id, field_id}
+        )
+        baseline_signature = hashlib.sha256(
+            repr(baseline_material).encode("utf-8")
+        ).hexdigest()
+        impact = self._conflict_impact(
+            conflict_type,
+            source_field_id=source_field_id,
+            target_field_id=target_field_id,
+            field_id=field_id,
+        )
+        return MergeConflict(
+            id=conflict_id,
+            type=conflict_type,
+            draft_ids=[left.id, right.id],
+            transform_id=transform_id,
+            source_field_id=source_field_id,
+            target_field_id=target_field_id,
+            field_id=field_id,
+            options=options,
+            impact_chain=impact,
+            fingerprint=fingerprint,
+            baseline_signature=baseline_signature,
+        )
+
+    def _conflict_impact(
+        self,
+        conflict_type: str,
+        *,
+        source_field_id: str | None,
+        target_field_id: str | None,
+        field_id: str | None,
+    ) -> dict[str, Any]:
+        if conflict_type == "deleted_field":
+            field = field_id
+            return {
+                "upstream": self._impact_field_chain(field, downstream=False),
+                "impact": self._impact_field_chain(field, downstream=True),
+            }
+        return {
+            "left_upstream": self._impact_field_chain(target_field_id, downstream=False),
+            "right_impact": self._impact_field_chain(source_field_id, downstream=True),
+        }
+
+    def _impact_field_chain(self, field_id: str | None, *, downstream: bool) -> list[str]:
+        if field_id is None:
+            return []
+        result = self.impact(field_id) if downstream else self.upstream(field_id)
+        chain = [field_id]
+        nodes = sorted(result.direct)
+        if nodes:
+            chain.extend(nodes)
+        transitive = sorted(result.transitive)
+        if transitive:
+            chain.extend(transitive)
+        return chain
+
+    @staticmethod
+    def _mapping_map(staged: DraftMapping) -> dict[tuple[str, str], dict[str, Any]]:
+        return {
+            (item["source_field_id"], item["target_field_id"]): item
+            for item in staged.mappings
+        }
+
+    @staticmethod
+    def _draft_transform_identity(staged: DraftMapping) -> dict[str, Any]:
+        return {
+            "transform_id": staged.transform_id,
+            "name": staged.name,
+            "version": staged.version,
+            "code_ref": staged.code_ref,
+            "description": staged.description,
+        }
+
+    @staticmethod
+    def _draft_field_references(drafts: Iterable[DraftMapping]) -> dict[str, list[dict[str, str]]]:
+        references: dict[str, list[dict[str, str]]] = defaultdict(list)
+        for draft in drafts:
+            for staged in draft.transforms:
+                for mapping in staged.mappings:
+                    for field_role in ("source_field_id", "target_field_id"):
+                        references[mapping[field_role]].append(
+                            {
+                                "draft_id": draft.id,
+                                "transform_id": staged.transform_id,
+                                "source_field_id": mapping["source_field_id"],
+                                "target_field_id": mapping["target_field_id"],
+                            }
+                        )
+        return dict(references)
+
+    def _combined_merge_plan(
+        self,
+        session: MergeSession,
+        conflicts: Iterable[MergeConflict],
+        *,
+        unresolved_only: bool = False,
+        active_conflicts: set[str] | None = None,
+    ) -> tuple[list[DraftMapping], set[str]]:
+        active_conflicts = active_conflicts or set()
+        decisions = {
+            decision.conflict_id: decision for decision in session.decisions
+        }
+        conflict_by_id = {conflict.id: conflict for conflict in conflicts}
+        left = self._require_open_reviewed_draft(session.draft_ids[0])
+        right = self._require_open_reviewed_draft(session.draft_ids[1])
+        deleted: set[str] = set(left.deleted_fields) | set(right.deleted_fields)
+        grouped: dict[str, list[tuple[DraftProposal, DraftMapping]]] = defaultdict(list)
+        for draft in (left, right):
+            for staged in draft.transforms:
+                grouped[staged.transform_id].append((draft, staged))
+
+        combined: list[DraftMapping] = []
+        for transform_id in sorted(grouped):
+            entries = grouped[transform_id]
+            metadata_choice = None
+            metadata_conflict_id = f"merge:{session.id}:metadata:{transform_id}"
+            metadata_conflict = conflict_by_id.get(metadata_conflict_id)
+            if metadata_conflict is not None:
+                decision = decisions.get(metadata_conflict_id)
+                if (
+                    unresolved_only
+                    and metadata_conflict_id in active_conflicts
+                ) or decision is None:
+                    continue
+                metadata_choice = decision.choice
+
+            if len(entries) == 1:
+                draft, staged = entries[0]
+            else:
+                has_metadata_conflict = metadata_conflict is not None
+                chosen_draft_id = session.draft_ids[
+                    0 if metadata_choice in (None, "left") else 1
+                ]
+                chosen_draft, chosen_staged = next(
+                    (draft_item, staged_item)
+                    for draft_item, staged_item in entries
+                    if draft_item.id == chosen_draft_id
+                )
+                if not has_metadata_conflict:
+                    staged = self._merge_transform_mapping(entries[0][1], entries[1][1])
+                else:
+                    staged = self._draft_mapping_with_identity(chosen_staged)
+                draft = chosen_draft
+
+            if len(entries) == 2:
+                left_staged = entries[0][1]
+                right_staged = entries[1][1]
+                left_maps = self._mapping_map(left_staged)
+                right_maps = self._mapping_map(right_staged)
+                merged_mappings: list[dict[str, Any]] = []
+                seen: set[tuple[str, str]] = set()
+                all_keys = sorted(set(left_maps) | set(right_maps))
+                for key in all_keys:
+                    conflict_id = (
+                        f"merge:{session.id}:mapping:{transform_id}:{key[0]}->{key[1]}"
+                    )
+                    if key in left_maps and key in right_maps:
+                        if left_maps[key].get("expression") == right_maps[key].get("expression"):
+                            chosen = left_maps[key]
+                        else:
+                            decision = decisions.get(conflict_id)
+                            if (
+                                unresolved_only and conflict_id in active_conflicts
+                            ) or decision is None:
+                                continue
+                            chosen = (
+                                left_maps[key]
+                                if decision.choice == "left"
+                                else right_maps[key]
+                            )
+                    elif key in left_maps:
+                        chosen = left_maps[key]
+                    else:
+                        chosen = right_maps[key]
+                    if (
+                        chosen["source_field_id"] in deleted
+                        or chosen["target_field_id"] in deleted
+                    ):
+                        continue
+                    if key not in seen:
+                        seen.add(key)
+                        merged_mappings.append(chosen)
+                staged = DraftMapping(
+                    transform_id=staged.transform_id,
+                    name=staged.name,
+                    version=staged.version,
+                    code_ref=staged.code_ref,
+                    description=staged.description,
+                    mappings=merged_mappings,
+                )
+
+            filtered_mappings = []
+            for mapping in staged.mappings:
+                blocked_by_delete = False
+                for field_id in (mapping["source_field_id"], mapping["target_field_id"]):
+                    conflict_id = f"merge:{session.id}:deleted-field:{field_id}"
+                    if field_id in deleted:
+                        decision = decisions.get(conflict_id)
+                        if (
+                            unresolved_only and conflict_id in active_conflicts
+                        ) or decision is None:
+                            blocked_by_delete = True
+                            break
+                        if decision.choice == "delete_field":
+                            blocked_by_delete = True
+                            break
+                if not blocked_by_delete:
+                    filtered_mappings.append(mapping)
+            if filtered_mappings:
+                combined.append(
+                    DraftMapping(
+                        transform_id=staged.transform_id,
+                        name=staged.name,
+                        version=staged.version,
+                        code_ref=staged.code_ref,
+                        description=staged.description,
+                        mappings=filtered_mappings,
+                    )
+                )
+
+        for field_id in list(deleted):
+            conflict_id = f"merge:{session.id}:deleted-field:{field_id}"
+            decision = decisions.get(conflict_id)
+            if conflict_by_id.get(conflict_id) is not None:
+                if (unresolved_only and conflict_id in active_conflicts) or decision is None:
+                    deleted.discard(field_id)
+                elif decision.choice == "keep_field":
+                    deleted.discard(field_id)
+        return combined, deleted
+
+    @staticmethod
+    def _merge_transform_mapping(
+        left: DraftMapping, right: DraftMapping
+    ) -> DraftMapping:
+        mappings = list(left.mappings)
+        seen = {
+            (item["source_field_id"], item["target_field_id"]) for item in mappings
+        }
+        for item in right.mappings:
+            key = (item["source_field_id"], item["target_field_id"])
+            if key not in seen:
+                mappings.append(item)
+                seen.add(key)
+        return DraftMapping(
+            transform_id=left.transform_id,
+            name=left.name,
+            version=left.version,
+            code_ref=left.code_ref,
+            description=left.description,
+            mappings=mappings,
+        )
+
+    @staticmethod
+    def _draft_mapping_with_identity(staged: DraftMapping) -> DraftMapping:
+        return DraftMapping(
+            transform_id=staged.transform_id,
+            name=staged.name,
+            version=staged.version,
+            code_ref=staged.code_ref,
+            description=staged.description,
+            mappings=list(staged.mappings),
+        )
+
+    @staticmethod
+    def _edge_set_difference(
+        current_edges: dict[str, Contribution], simulated: dict[str, Contribution]
+    ) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
+        current_keys = {
+            (edge.transform_id, edge.source_field_id, edge.target_field_id)
+            for edge in current_edges.values()
+        }
+        simulated_keys = {
+            (edge.transform_id, edge.source_field_id, edge.target_field_id)
+            for edge in simulated.values()
+        }
+        return (
+            sorted(simulated_keys - current_keys),
+            sorted(current_keys - simulated_keys),
+        )
+
+    @staticmethod
+    def _lost_sources(
+        current_edges: dict[str, Contribution],
+        simulated: dict[str, Contribution],
+        deleted_fields: set[str],
+    ) -> dict[str, list[str]]:
+        current_sources: dict[str, set[str]] = defaultdict(set)
+        simulated_sources: dict[str, set[str]] = defaultdict(set)
+        for edge in current_edges.values():
+            current_sources[edge.target_field_id].add(edge.source_field_id)
+        for edge in simulated.values():
+            simulated_sources[edge.target_field_id].add(edge.source_field_id)
+        return {
+            target: sorted(current_sources[target] - simulated_sources.get(target, set()))
+            for target in current_sources
+            if target not in deleted_fields
+            and current_sources[target] - simulated_sources.get(target, set())
+        }
+
+    def _merge_explanations(
+        self,
+        left: DraftProposal,
+        right: DraftProposal,
+        conflicts: list[MergeConflict],
+        session: MergeSession,
+        new_cycles: list[list[str]],
+        lost_sources: dict[str, list[str]],
+        added: list[tuple[str, str, str]],
+        removed: list[tuple[str, str, str]],
+    ) -> list[dict[str, Any]]:
+        decisions = {item.conflict_id: item.choice for item in session.decisions}
+        explanations = [
+            {
+                "kind": "source_change",
+                "draft_id": left.id,
+                "transforms": [item.transform_id for item in left.transforms],
+                "deleted_fields": list(left.deleted_fields),
+            },
+            {
+                "kind": "source_change",
+                "draft_id": right.id,
+                "transforms": [item.transform_id for item in right.transforms],
+                "deleted_fields": list(right.deleted_fields),
+            },
+        ]
+        for cycle in new_cycles:
+            explanations.append(
+                {
+                    "kind": "new_cycle",
+                    "cycle": cycle,
+                    "source_draft_ids": self._evidence_draft_ids(
+                        cycle, left, right
+                    ),
+                }
+            )
+        for target, sources in sorted(lost_sources.items()):
+            explanations.append(
+                {
+                    "kind": "lost_sources",
+                    "target_field_id": target,
+                    "lost_source_field_ids": sources,
+                    "source_draft_ids": self._evidence_draft_ids(
+                        [*sources, target], left, right
+                    ),
+                    "conflict_ids": [
+                        conflict.id
+                        for conflict in conflicts
+                        if conflict.target_field_id == target
+                        or conflict.field_id in sources
+                        or conflict.field_id == target
+                    ],
+                }
+            )
+        return explanations
+
+    @staticmethod
+    def _evidence_draft_ids(
+        field_ids: list[str],
+        left: DraftProposal,
+        right: DraftProposal,
+    ) -> list[str]:
+        field_set = set(field_ids)
+        result = []
+        for draft in (left, right):
+            staged_touch = any(
+                source in field_set or target in field_set
+                for staged in draft.transforms
+                for mapping in staged.mappings
+                for source, target in [
+                    (mapping["source_field_id"], mapping["target_field_id"])
+                ]
+            )
+            deleted_touch = any(field_id in field_set for field_id in draft.deleted_fields)
+            if staged_touch or deleted_touch:
+                result.append(draft.id)
+        return result
 
     def draft_diff(self, draft_id: str) -> DraftDiff:
         """Compare a draft against the current effective graph.
@@ -669,24 +1411,9 @@ class LineageService:
 
         draft = self._require_draft(draft_id)
         current_edges = self._effective_edges()
-        simulated = dict(current_edges)
-        for staged in draft.transforms:
-            for edge_id, edge in list(simulated.items()):
-                if edge.transform_id == staged.transform_id:
-                    del simulated[edge_id]
-            for mapping in staged.mappings:
-                edge_id = self._contribution_id(
-                    staged.transform_id,
-                    mapping["source_field_id"],
-                    mapping["target_field_id"],
-                )
-                simulated[edge_id] = Contribution(
-                    id=edge_id,
-                    transform_id=staged.transform_id,
-                    source_field_id=mapping["source_field_id"],
-                    target_field_id=mapping["target_field_id"],
-                    expression=mapping.get("expression"),
-                )
+        simulated, deleted = self._simulate_changes(
+            current_edges, set(), draft.transforms, draft.deleted_fields
+        )
 
         current_keys = {
             (edge.transform_id, edge.source_field_id, edge.target_field_id)
@@ -705,6 +1432,9 @@ class LineageService:
         simulated_sources: dict[str, set[str]] = defaultdict(set)
         for edge in simulated.values():
             simulated_sources[edge.target_field_id].add(edge.source_field_id)
+        for field_id in deleted:
+            current_sources.pop(field_id, None)
+            simulated_sources.pop(field_id, None)
         lost = {
             target: sorted(current_sources[target] - simulated_sources.get(target, set()))
             for target in current_sources
@@ -756,12 +1486,21 @@ class LineageService:
             raise ValidationError(f"draft '{draft_id}' is {draft.status}")
         if not draft.transforms:
             raise ValidationError("draft has no staged transforms")
+        if draft.metadata.get("pending"):
+            raise ValidationError(
+                "draft is an unresolved merge output; resolve all conflicts first"
+            )
         if draft.base_revision != self.store.revision and not confirm_stale:
             raise StaleBaselineError(
                 draft_id, draft.base_revision, self.store.revision
             )
         for staged in draft.transforms:
             for mapping in staged.mappings:
+                if (
+                    mapping["source_field_id"] in draft.deleted_fields
+                    or mapping["target_field_id"] in draft.deleted_fields
+                ):
+                    raise ValidationError("draft both deletes and maps a field")
                 self._check_mapping_fields(
                     mapping["source_field_id"], mapping["target_field_id"]
                 )
@@ -771,9 +1510,13 @@ class LineageService:
             key: Contribution(**item.to_dict())
             for key, item in self.store.contributions.items()
         }
+        backup_fields = {
+            key: Field(**item.to_dict()) for key, item in self.store.fields.items()
+        }
         backup_revision = self.store.revision
         activated: list[str] = []
         deactivated: list[str] = []
+        deactivated_fields: list[str] = []
         created_transforms: list[str] = []
         try:
             for staged in draft.transforms:
@@ -823,6 +1566,11 @@ class LineageService:
                     ):
                         edge.active = False
                         deactivated.append(edge.id)
+            for field_id in draft.deleted_fields:
+                field_item = self.store.fields.get(field_id)
+                if field_item is not None:
+                    field_item.active = False
+                    deactivated_fields.append(field_id)
             self.store.revision += 1
             draft.status = "published"
             entry = HistoryEntry(
@@ -833,6 +1581,7 @@ class LineageService:
                 note=note,
                 activated=activated,
                 deactivated=deactivated,
+                deactivated_fields=deactivated_fields,
                 created_transforms=created_transforms,
                 snapshot=self._graph_snapshot(),
             )
@@ -841,6 +1590,7 @@ class LineageService:
         except Exception:
             self.store.transforms = backup_transforms
             self.store.contributions = backup_contributions
+            self.store.fields = backup_fields
             self.store.revision = backup_revision
             draft.status = "open"
             self.store.history = [
@@ -898,6 +1648,10 @@ class LineageService:
                 transform = self.store.transforms.get(transform_id)
                 if transform is not None:
                     transform.active = False
+            for field_id in getattr(original, "deactivated_fields", []):
+                field_item = self.store.fields.get(field_id)
+                if field_item is not None:
+                    field_item.active = True
             self.store.revision += 1
             entry = HistoryEntry(
                 id=f"history:r{self.store.revision}:withdraw:{original.draft_id}",
@@ -936,6 +1690,43 @@ class LineageService:
                 continue
             edges[edge.id] = edge
         return edges
+
+    @staticmethod
+    def _simulate_changes(
+        current_edges: dict[str, Contribution],
+        deleted_fields: set[str],
+        staged_transforms: Iterable[DraftMapping],
+        draft_deleted_fields: Iterable[str] = (),
+    ) -> tuple[dict[str, Contribution], set[str]]:
+        simulated = dict(current_edges)
+        deleted = set(deleted_fields)
+        deleted.update(draft_deleted_fields)
+        for staged in staged_transforms:
+            for edge_id, edge in list(simulated.items()):
+                if edge.transform_id == staged.transform_id:
+                    del simulated[edge_id]
+            for mapping in staged.mappings:
+                source_id = mapping["source_field_id"]
+                target_id = mapping["target_field_id"]
+                if source_id in deleted or target_id in deleted:
+                    continue
+                edge_id = LineageService._contribution_id(
+                    staged.transform_id, source_id, target_id
+                )
+                simulated[edge_id] = Contribution(
+                    id=edge_id,
+                    transform_id=staged.transform_id,
+                    source_field_id=source_id,
+                    target_field_id=target_id,
+                    expression=mapping.get("expression"),
+                )
+        for field_id in deleted:
+            simulated = {
+                edge_id: edge
+                for edge_id, edge in simulated.items()
+                if field_id not in (edge.source_field_id, edge.target_field_id)
+            }
+        return simulated, deleted
 
     def _graph_snapshot(self) -> dict[str, Any]:
         return {
@@ -1009,4 +1800,40 @@ class DraftDiff:
             "removed_dependencies": self.removed_dependencies,
             "lost_sources": self.lost_sources,
             "new_cycles": self.new_cycles,
+        }
+
+
+@dataclass(slots=True)
+class MergePreview:
+    session_id: str
+    output_draft_id: str
+    source_draft_ids: list[str]
+    base_revision: int
+    current_revision: int
+    stale: bool
+    conflicts: list[dict[str, Any]]
+    unresolved_conflicts: list[str]
+    reconfirm_conflicts: list[str]
+    added_dependencies: list[dict[str, Any]]
+    removed_dependencies: list[dict[str, Any]]
+    lost_sources: dict[str, list[str]]
+    new_cycles: list[list[str]]
+    explanations: list[dict[str, Any]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "output_draft_id": self.output_draft_id,
+            "source_draft_ids": self.source_draft_ids,
+            "base_revision": self.base_revision,
+            "current_revision": self.current_revision,
+            "stale": self.stale,
+            "conflicts": self.conflicts,
+            "unresolved_conflicts": self.unresolved_conflicts,
+            "reconfirm_conflicts": self.reconfirm_conflicts,
+            "added_dependencies": self.added_dependencies,
+            "removed_dependencies": self.removed_dependencies,
+            "lost_sources": self.lost_sources,
+            "new_cycles": self.new_cycles,
+            "explanations": self.explanations,
         }

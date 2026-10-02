@@ -30,6 +30,7 @@ class Field:
     object_id: str
     name: str
     data_type: str | None = None
+    active: bool = True
     metadata: dict[str, Any] = field(default_factory=_new_metadata)
 
     def to_dict(self) -> dict[str, Any]:
@@ -106,6 +107,7 @@ class DraftProposal:
     base_revision: int
     status: str = "open"  # open | published | discarded
     transforms: list[DraftMapping] = field(default_factory=list)
+    deleted_fields: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=_new_metadata)
 
     def to_dict(self) -> dict[str, Any]:
@@ -121,6 +123,69 @@ class DraftProposal:
 
 
 @dataclass(slots=True)
+class MergeConflict:
+    """A user-visible conflict discovered while combining two drafts."""
+
+    id: str
+    type: str  # same_mapping | transform_metadata | deleted_field
+    draft_ids: list[str]
+    transform_id: str | None = None
+    source_field_id: str | None = None
+    target_field_id: str | None = None
+    field_id: str | None = None
+    options: dict[str, Any] = field(default_factory=_new_metadata)
+    impact_chain: dict[str, Any] = field(default_factory=_new_metadata)
+    fingerprint: str = ""
+    baseline_signature: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MergeConflict":
+        return cls(**data)
+
+
+@dataclass(slots=True)
+class MergeDecision:
+    conflict_id: str
+    choice: str
+    fingerprint: str
+    confirmed_revision: int = 0
+    baseline_signature: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MergeDecision":
+        return cls(**data)
+
+
+@dataclass(slots=True)
+class MergeSession:
+    """Interactive, persistable state for merging two reviewed drafts."""
+
+    id: str
+    output_draft_id: str
+    draft_ids: list[str]
+    base_revision: int
+    status: str = "open"  # open | published | abandoned
+    decisions: list[MergeDecision] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MergeSession":
+        data = dict(data)
+        data["decisions"] = [
+            MergeDecision.from_dict(item) for item in data.get("decisions", [])
+        ]
+        return cls(**data)
+
+
+@dataclass(slots=True)
 class HistoryEntry:
     """One committed graph change, kept forever for audit and rollback."""
 
@@ -131,6 +196,7 @@ class HistoryEntry:
     note: str | None = None
     activated: list[str] = field(default_factory=list)
     deactivated: list[str] = field(default_factory=list)
+    deactivated_fields: list[str] = field(default_factory=list)
     created_transforms: list[str] = field(default_factory=list)
     snapshot: dict[str, Any] = field(default_factory=_new_metadata)
 

@@ -197,6 +197,144 @@ class DraftProposalTest(unittest.TestCase):
                 "d1", "t.a", "a", "1", [("orders.v1.amount", "enriched.v1.total", "a")]
             )
 
+    def test_merge_keeps_different_sources_and_requires_same_mapping_choice(self):
+        self.service.create_draft("a", "add tier")
+        self.service.stage_transform(
+            "a", "t.segment.v2", "build_segment", "2",
+            [("customers.v1.tier", "enriched.v1.segment", "tier")],
+        )
+        self.service.create_draft("b", "change region expression")
+        self.service.stage_transform(
+            "b", "t.segment.v2", "build_segment", "2",
+            [("orders.v1.region", "enriched.v1.segment", "lower(region)")],
+        )
+
+        preview = self.service.begin_merge("m1", "merged", "a", "b")
+        self.assertFalse(preview.unresolved_conflicts)
+        self.assertEqual(
+            {
+                (item["source_field_id"], item["target_field_id"])
+                for item in preview.added_dependencies
+            },
+            {
+                ("customers.v1.tier", "enriched.v1.segment"),
+                ("orders.v1.region", "enriched.v1.segment"),
+            },
+        )
+        self.service.publish_merge("m1")
+        self.assertEqual(
+            set(self.service.upstream("enriched.v1.segment").direct),
+            {"orders.v1.region", "customers.v1.tier"},
+        )
+        self.assertEqual(self.service.store.drafts["a"].status, "open")
+        self.assertEqual(self.service.store.drafts["b"].status, "open")
+
+    def test_merge_reports_delete_reference_conflict_and_retains_decision_on_preview(self):
+        self.service.submit_transform(
+            "t.total.v1", "build_total", "1",
+            [("orders.v1.amount", "enriched.v1.total", "amount")],
+        )
+        self.service.create_draft("delete", "remove amount")
+        self.service.stage_field_deletion("delete", "orders.v1.amount")
+        self.service.create_draft("use", "reuse amount")
+        self.service.stage_transform(
+            "use", "t.total.v2", "build_total", "2",
+            [("orders.v1.amount", "enriched.v1.total", "amount * 2")],
+        )
+
+        preview = self.service.begin_merge("m1", "merged", "delete", "use")
+        conflict_id = "merge:m1:deleted-field:orders.v1.amount"
+        self.assertEqual(preview.unresolved_conflicts, [conflict_id])
+        self.assertEqual(
+            self.service.store.drafts["merged"].transforms,
+            [],
+        )
+        preview = self.service.resolve_merge_conflict(
+            "m1", conflict_id, "keep_field"
+        )
+        self.assertEqual(preview.unresolved_conflicts, [])
+        self.service.preview_merge("m1")
+        self.reload()
+        preview = self.service.preview_merge("m1")
+        self.assertEqual(preview.unresolved_conflicts, [])
+        self.service.publish_merge("m1")
+        self.assertTrue(self.service.store.fields["orders.v1.amount"].active)
+        self.assertIn("orders.v1.amount", self.service.upstream("enriched.v1.total").direct)
+
+    def test_merge_same_mapping_conflict_does_not_enter_graph_until_selected(self):
+        self.service.create_draft("a", "upper")
+        self.service.stage_transform(
+            "a", "t.segment.v1", "build_segment", "1",
+            [("orders.v1.region", "enriched.v1.segment", "upper(region)")],
+        )
+        self.service.create_draft("b", "lower")
+        self.service.stage_transform(
+            "b", "t.segment.v1", "build_segment", "1",
+            [("orders.v1.region", "enriched.v1.segment", "lower(region)")],
+        )
+
+        preview = self.service.begin_merge("m1", "merged", "a", "b")
+        conflict_id = preview.unresolved_conflicts[0]
+        with self.assertRaises(ValidationError):
+            self.service.publish_merge("m1")
+        self.service.resolve_merge_conflict("m1", conflict_id, "right")
+        self.service.publish_merge("m1")
+        edge = self.service.store.contributions[
+            "contrib:t.segment.v1:orders.v1.region->enriched.v1.segment"
+        ]
+        self.assertEqual(edge.expression, "lower(region)")
+
+    def test_merge_baseline_change_only_reconfirms_related_decision(self):
+        self.service.create_draft("a", "segment conflict left")
+        self.service.stage_transform(
+            "a", "t.segment.v1", "build_segment", "1",
+            [("orders.v1.region", "enriched.v1.segment", "upper(region)")],
+        )
+        self.service.create_draft("b", "segment conflict right")
+        self.service.stage_transform(
+            "b", "t.segment.v1", "build_segment", "1",
+            [("orders.v1.region", "enriched.v1.segment", "lower(region)")],
+        )
+        self.service.begin_merge("m1", "merged", "a", "b")
+        conflict_id = self.service.preview_merge("m1").unresolved_conflicts[0]
+        self.service.resolve_merge_conflict("m1", conflict_id, "left")
+
+        other = self.service.create_draft("other", "unrelated baseline move")
+        self.service.stage_transform(
+            other.id, "t.total.v1", "build_total", "1",
+            [("customers.v1.tier", "enriched.v1.total", "tier")],
+        )
+        self.service.publish_draft(other.id)
+
+        preview = self.service.preview_merge("m1")
+        self.assertTrue(preview.stale)
+        self.assertEqual(preview.reconfirm_conflicts, [])
+        self.service.publish_merge("m1", confirm_stale=True)
+        self.assertEqual(
+            self.service.store.contributions[
+                "contrib:t.segment.v1:orders.v1.region->enriched.v1.segment"
+            ].expression,
+            "upper(region)",
+        )
+
+    def test_abandon_merge_preserves_source_drafts(self):
+        self.service.create_draft("a", "x")
+        self.service.stage_transform(
+            "a", "t.a", "a", "1",
+            [("customers.v1.tier", "enriched.v1.segment", "tier")],
+        )
+        self.service.create_draft("b", "y")
+        self.service.stage_transform(
+            "b", "t.b", "b", "1",
+            [("orders.v1.amount", "enriched.v1.total", "amount")],
+        )
+        self.service.begin_merge("m1", "merged", "a", "b")
+        self.service.abandon_merge("m1")
+        self.assertEqual(self.service.store.drafts["a"].status, "open")
+        self.assertEqual(self.service.store.drafts["b"].status, "open")
+        self.assertEqual(self.service.store.drafts["merged"].status, "discarded")
+        self.assertEqual(self.service.store.history, [])
+
 
 if __name__ == "__main__":
     unittest.main()

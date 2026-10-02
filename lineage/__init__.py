@@ -14,9 +14,10 @@ from .models import (
     DraftProposal,
     Field,
     HistoryEntry,
+    MergeSession,
     TransformVersion,
 )
-from .service import DraftDiff, LineageQueryResult, LineageService
+from .service import DraftDiff, LineageQueryResult, LineageService, MergePreview
 from .store import JsonLineageStore
 
 __all__ = [
@@ -32,6 +33,8 @@ __all__ = [
     "LineageError",
     "LineageQueryResult",
     "LineageService",
+    "MergePreview",
+    "MergeSession",
     "NotFoundError",
     "StaleBaselineError",
     "TransformVersion",

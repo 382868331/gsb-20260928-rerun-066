@@ -148,6 +148,10 @@ def build_parser() -> argparse.ArgumentParser:
     stage.add_argument("--mapping", action="append", nargs=3,
                        metavar=("SOURCE_FIELD", "TARGET_FIELD", "EXPRESSION"), required=True)
 
+    stage_delete = subparsers.add_parser("stage-field-deletion")
+    stage_delete.add_argument("draft_id")
+    stage_delete.add_argument("field_id")
+
     diff = subparsers.add_parser("draft-diff")
     diff.add_argument("draft_id")
 
@@ -158,6 +162,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     discard = subparsers.add_parser("discard-draft")
     discard.add_argument("draft_id")
+
+    begin_merge = subparsers.add_parser("begin-merge")
+    begin_merge.add_argument("session_id")
+    begin_merge.add_argument("output_draft_id")
+    begin_merge.add_argument("left_draft_id")
+    begin_merge.add_argument("right_draft_id")
+
+    preview_merge = subparsers.add_parser("preview-merge")
+    preview_merge.add_argument("session_id")
+
+    resolve_merge = subparsers.add_parser("resolve-merge")
+    resolve_merge.add_argument("session_id")
+    resolve_merge.add_argument("conflict_id")
+    resolve_merge.add_argument("choice", choices=["left", "right", "delete_field", "keep_field"])
+
+    publish_merge = subparsers.add_parser("publish-merge")
+    publish_merge.add_argument("session_id")
+    publish_merge.add_argument("--confirm-stale", action="store_true")
+    publish_merge.add_argument("--note")
+
+    abandon_merge = subparsers.add_parser("abandon-merge")
+    abandon_merge.add_argument("session_id")
 
     withdraw = subparsers.add_parser("withdraw-publish")
     withdraw.add_argument("history_id")
@@ -253,6 +279,10 @@ def main(argv: list[str] | None = None) -> None:
         )
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return
+    elif args.command == "stage-field-deletion":
+        result = service.stage_field_deletion(args.draft_id, args.field_id)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
     elif args.command == "draft-diff":
         print(json.dumps(service.draft_diff(args.draft_id).to_dict(), ensure_ascii=False, indent=2))
         return
@@ -264,6 +294,34 @@ def main(argv: list[str] | None = None) -> None:
         return
     elif args.command == "discard-draft":
         print(json.dumps(service.discard_draft(args.draft_id).to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "begin-merge":
+        preview = service.begin_merge(
+            args.session_id,
+            args.output_draft_id,
+            args.left_draft_id,
+            args.right_draft_id,
+        )
+        print(json.dumps(preview.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "preview-merge":
+        print(json.dumps(service.preview_merge(args.session_id).to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "resolve-merge":
+        preview = service.resolve_merge_conflict(
+            args.session_id, args.conflict_id, args.choice
+        )
+        print(json.dumps(preview.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "publish-merge":
+        entry = service.publish_merge(
+            args.session_id, confirm_stale=args.confirm_stale, note=args.note
+        )
+        print(json.dumps(entry.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "abandon-merge":
+        session = service.abandon_merge(args.session_id)
+        print(json.dumps(session.to_dict(), ensure_ascii=False, indent=2))
         return
     elif args.command == "withdraw-publish":
         print(json.dumps(service.withdraw_publish(args.history_id, note=args.note).to_dict(), ensure_ascii=False, indent=2))
