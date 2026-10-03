@@ -30,6 +30,10 @@
 - 基线核对：每个草稿记录 `base_revision`；两个草稿基于同一旧版先后提交时，后一份发布会抛出 `StaleBaselineError`，需用户重新确认（`confirm_stale=True`）后才落盘，不会静默覆盖先发布的成果。
 - 历史快照：每次发布与撤回都追加一条 `HistoryEntry`，内含发布前完整图快照；批量校验失败或保存中断时内存与磁盘整体回滚，历史图保持完整。
 - 发布撤回：`withdraw_publish(history_id)` 软删除该次发布启用的边并恢复其停用的边，撤回本身也作为历史条目永久保留。
+- 字段拆分迁移：`create_field_split` 只建立独立拆分声明；`record_split_decision` 采用人工明确的新字段解释，`record_manual_split_dependency` 标记仍需判断，系统不会按字段名自动映射。
+- 分批采用：`plan_split_migration` 先展示范围内未决依赖、共享中间结果冲突和影响链；`create_split_migration_batch` 生成独立草稿，发布后同一正式图中可同时保留旧解释路径与新解释路径。
+- 撤回复核：迁移批次保存采用的解释和发布时间；撤回某批后，依赖该批决定的后续已发布批次会被标记为 `requires_recheck`，来源前后对比保留在批次记录中。
+- 旧字段退役：`create_split_retirement_draft` 只在所有实际依赖均已处置且没有剩余旧边时生成软删草稿；失败发布沿用原子回滚，不落部分正式图。
 
 ## Python API
 
@@ -109,6 +113,56 @@ service.withdraw_publish(entry.id)
 service.history()
 ```
 
+### 字段拆分与下游分批迁移
+
+```python
+service.create_field_split(
+    "split.contact",
+    "raw.v1.contact",
+    ["raw.v1.email", "raw.v1.phone"],
+)
+
+# 明确某条旧依赖采用 email；shared intermediate 可指定新的并行结果。
+service.record_split_decision(
+    "split.contact",
+    "t.profile",
+    "mid.v1.profile",
+    "raw.v1.email",
+    new_target_field_id="mid.v1.profile_email",
+    rationale="customer path explicitly uses email",
+)
+
+# 语义不明的依赖保持 manual，不会接到第一个新字段。
+service.record_manual_split_dependency(
+    "split.contact", "t.billing", "out.v1.billing", "phone or email must be reviewed"
+)
+
+print(service.split_report("split.contact"))
+plan = service.plan_split_migration(
+    "split.contact",
+    ["mid.v1.profile", "mid.v1.profile_email", "out.v1.customer_email"],
+)
+if not plan["unresolved"] and not plan["conflicts"]:
+    batch = service.create_split_migration_batch(
+        "batch.customer.email",
+        "split.contact",
+        ["mid.v1.profile", "mid.v1.profile_email", "out.v1.customer_email"],
+        additional_paths=[
+            {
+                "transform_id": "t.customer",
+                "source_field_id": "mid.v1.profile_email",
+                "target_field_id": "out.v1.customer_email",
+                "expression": "email_profile",
+            }
+        ],
+    )
+    entry = service.publish_split_migration_batch("batch.customer.email")
+    service.withdraw_publish(entry.id)
+
+# 全部依赖迁移并核对 report 后再退役旧字段。
+service.create_split_retirement_draft("split.contact")
+```
+
 建议由提交方生成稳定、可读且全局唯一的 ID，例如：
 
 - 对象：`database.schema.table.version`，如 `dw.dim_customer.v20260929`。
@@ -140,6 +194,14 @@ python -m lineage.cli --store lineage.json resolve-merge m1 'merge:m1:deleted-fi
 python -m lineage.cli --store lineage.json publish-merge m1 --confirm-stale --note 'release plan'
 python -m lineage.cli --store lineage.json abandon-merge m1
 python -m lineage.cli --store lineage.json withdraw-publish history:r1:publish:d1
+python -m lineage.cli --store lineage.json create-field-split split.contact raw.v1.contact raw.v1.email raw.v1.phone
+python -m lineage.cli --store lineage.json record-split-decision split.contact t.profile mid.v1.profile raw.v1.email --new-target-field-id mid.v1.profile_email --rationale reviewed
+python -m lineage.cli --store lineage.json record-split-manual split.contact t.billing out.v1.billing 'needs review'
+python -m lineage.cli --store lineage.json split-report split.contact
+python -m lineage.cli --store lineage.json plan-split-migration split.contact mid.v1.profile mid.v1.profile_email out.v1.customer_email
+python -m lineage.cli --store lineage.json create-split-batch batch.customer split.contact mid.v1.profile mid.v1.profile_email out.v1.customer_email
+python -m lineage.cli --store lineage.json publish-split-batch batch.customer
+python -m lineage.cli --store lineage.json create-split-retirement split.contact
 python -m lineage.cli --store lineage.json history
 ```
 
@@ -147,7 +209,7 @@ python -m lineage.cli --store lineage.json history
 
 ## 持久化格式
 
-JSON 文件包含 `objects`、`fields`、`transforms`、`contributions` 四个图集合，以及 `drafts`（草稿方案，含草稿软删字段）、`merge_sessions`（合并会话与逐项决定）、`history`（含完整图快照的发布/撤回记录）和 `revision`（基线版本号）。保存采用临时文件加原子替换，适合当前单机、低频提交的工具集成场景。其他处理工具可以直接复用 `LineageService` 提交同构关系；后续也可以把 `JsonLineageStore` 替换成数据库仓储，而保持服务接口不变。
+JSON 文件包含 `objects`、`fields`、`transforms`、`contributions` 四个图集合，以及 `drafts`（草稿方案，含草稿软删字段）、`field_splits`（字段拆分声明与人工解释）、`migration_batches`（分批迁移、来源对比和撤回审计）、`merge_sessions`（合并会话与逐项决定）、`history`（含完整图快照的发布/撤回记录）和 `revision`（基线版本号）。保存采用临时文件加原子替换，适合当前单机、低频提交的工具集成场景。其他处理工具可以直接复用 `LineageService` 提交同构关系；后续也可以把 `JsonLineageStore` 替换成数据库仓储，而保持服务接口不变。
 
 ## 测试
 

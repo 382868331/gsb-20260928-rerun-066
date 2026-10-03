@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 from typing import Any, Iterable
 
@@ -16,8 +17,10 @@ from .models import (
     DataObject,
     DraftMapping,
     DraftProposal,
+    FieldSplit,
     Field,
     HistoryEntry,
+    MigrationBatch,
     MergeConflict,
     MergeDecision,
     MergeSession,
@@ -576,6 +579,546 @@ class LineageService:
             return self.store.objects[object_id]
         except KeyError:
             raise NotFoundError(f"data object '{object_id}' does not exist") from None
+
+    # --- Field splits and phased migration -------------------------------
+
+    def create_field_split(
+        self,
+        split_id: str,
+        old_field_id: str,
+        new_field_ids: Iterable[str],
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> FieldSplit:
+        """Create an explicit split proposal without changing the graph."""
+
+        if split_id in self.store.field_splits:
+            raise AlreadyExistsError(f"field split '{split_id}' already exists")
+        old_field = self._require_field(old_field_id)
+        if not old_field.active:
+            raise ValidationError(f"old field '{old_field_id}' is not active")
+        new_field_ids = list(new_field_ids)
+        if not new_field_ids:
+            raise ValidationError("a field split must declare at least one new field")
+        if len(set(new_field_ids)) != len(new_field_ids):
+            raise ValidationError("new field ids must be unique")
+        if old_field_id in new_field_ids:
+            raise ValidationError("a split field cannot also be the old field")
+        for field_id in new_field_ids:
+            field_item = self._require_field(field_id)
+            if not field_item.active:
+                raise ValidationError(f"new field '{field_id}' is not active")
+            if field_item.name == old_field.name:
+                raise ValidationError(
+                    "a similar field name is not evidence that fields are equivalent"
+                )
+        split = FieldSplit(
+            id=split_id,
+            old_field_id=old_field_id,
+            new_field_ids=list(new_field_ids),
+            base_revision=self.store.revision,
+            metadata=metadata or {},
+        )
+        self.store.field_splits[split_id] = split
+        self.store.save()
+        return split
+
+    def _require_field_split(self, split_id: str) -> FieldSplit:
+        try:
+            split = self.store.field_splits[split_id]
+        except KeyError:
+            raise NotFoundError(f"field split '{split_id}' does not exist") from None
+        if split.status != "open":
+            raise ValidationError(f"field split '{split_id}' is {split.status}")
+        return split
+
+    def _split_edge_id(self, split: FieldSplit, transform_id: str, target_field_id: str) -> str:
+        return self._contribution_id(
+            transform_id, split.old_field_id, target_field_id
+        )
+
+    def record_split_decision(
+        self,
+        split_id: str,
+        transform_id: str,
+        target_field_id: str,
+        new_field_id: str,
+        *,
+        new_target_field_id: str | None = None,
+        rationale: str | None = None,
+    ) -> FieldSplit:
+        """Record a human-reviewed exact edge-to-new-field interpretation."""
+
+        split = self._require_field_split(split_id)
+        edge_id = self._split_edge_id(split, transform_id, target_field_id)
+        edge = self.store.contributions.get(edge_id)
+        if edge is None or not edge.active:
+            raise NotFoundError(
+                f"active dependency {split.old_field_id} -> {target_field_id} "
+                f"for transform '{transform_id}' does not exist"
+            )
+        transform = self.store.transforms.get(transform_id)
+        if transform is None or not transform.active:
+            raise NotFoundError(f"transform '{transform_id}' does not exist")
+        if new_field_id not in split.new_field_ids:
+            raise ValidationError(
+                f"field '{new_field_id}' is not declared by split '{split_id}'"
+            )
+        if new_target_field_id is not None:
+            new_target = self._require_field(new_target_field_id)
+            if not new_target.active:
+                raise ValidationError(
+                    f"new target field '{new_target_field_id}' is not active"
+                )
+        split.decisions[edge_id] = {
+            "status": "explicit",
+            "transform_id": transform_id,
+            "old_field_id": split.old_field_id,
+            "target_field_id": target_field_id,
+            "new_field_id": new_field_id,
+            "new_target_field_id": new_target_field_id,
+            "rationale": rationale,
+        }
+        self.store.save()
+        return split
+
+    def record_manual_split_dependency(
+        self,
+        split_id: str,
+        transform_id: str,
+        target_field_id: str,
+        reason: str,
+    ) -> FieldSplit:
+        """Mark an old-field dependency as requiring human interpretation."""
+
+        if not reason:
+            raise ValidationError("a manual review reason is required")
+        split = self._require_field_split(split_id)
+        edge_id = self._split_edge_id(split, transform_id, target_field_id)
+        edge = self.store.contributions.get(edge_id)
+        if edge is None or not edge.active:
+            raise NotFoundError(
+                f"active dependency {split.old_field_id} -> {target_field_id} "
+                f"for transform '{transform_id}' does not exist"
+            )
+        split.decisions[edge_id] = {
+            "status": "manual",
+            "transform_id": transform_id,
+            "old_field_id": split.old_field_id,
+            "target_field_id": target_field_id,
+            "reason": reason,
+        }
+        self.store.save()
+        return split
+
+    def _active_old_edges(self, split: FieldSplit) -> list[Contribution]:
+        return [
+            edge
+            for edge in self._effective_edges().values()
+            if edge.source_field_id == split.old_field_id
+        ]
+
+    def split_report(self, split_id: str) -> dict[str, Any]:
+        split = self._require_field_split(split_id)
+        old_dependencies: list[dict[str, Any]] = []
+        adoptable: list[dict[str, Any]] = []
+        adopted: list[dict[str, Any]] = []
+        manual: list[dict[str, Any]] = []
+        decided_old_targets = {
+            (item["transform_id"], item["target_field_id"]): item
+            for item in split.decisions.values()
+        }
+        decided_new_targets = {
+            (
+                item["transform_id"],
+                item.get("new_target_field_id") or item["target_field_id"],
+            ): item
+            for item in split.decisions.values()
+        }
+
+        for edge in sorted(self._active_old_edges(split), key=lambda item: item.id):
+            decision = split.decisions.get(edge.id)
+            payload = {
+                "transform_id": edge.transform_id,
+                "old_field_id": edge.source_field_id,
+                "target_field_id": edge.target_field_id,
+                "expression": edge.expression,
+                "impact_chain": self._impact_field_chain(
+                    edge.target_field_id, downstream=True
+                ),
+            }
+            if decision is None:
+                old_dependencies.append(payload)
+            elif decision.get("status") == "manual":
+                manual.append({**payload, "reason": decision.get("reason")})
+            else:
+                adoptable.append({**payload, "new_field_id": decision["new_field_id"]})
+
+        for edge in sorted(self._effective_edges().values(), key=lambda item: item.id):
+            if edge.source_field_id not in split.new_field_ids:
+                continue
+            decision = decided_new_targets.get((edge.transform_id, edge.target_field_id))
+            expected_target = edge.target_field_id
+            if decision is not None and (
+                decision.get("new_target_field_id")
+                or decision["target_field_id"]
+            ) != expected_target:
+                decision = None
+            if (
+                decision is None
+                or decision.get("status") != "explicit"
+                or decision.get("transform_id") != edge.transform_id
+                or decision.get("new_field_id") != edge.source_field_id
+            ):
+                continue
+            adopted.append(
+                {
+                    "transform_id": edge.transform_id,
+                    "old_field_id": split.old_field_id,
+                    "new_field_id": edge.source_field_id,
+                    "target_field_id": edge.target_field_id,
+                    "expression": edge.expression,
+                }
+            )
+
+        return {
+            "split_id": split.id,
+            "old_field_id": split.old_field_id,
+            "new_field_ids": list(split.new_field_ids),
+            "old_dependencies": old_dependencies,
+            "adoptable_dependencies": adoptable,
+            "adopted_dependencies": adopted,
+            "manual_dependencies": manual,
+            "remaining_old_dependency_count": (
+                len(old_dependencies) + len(manual) + len(adoptable)
+            ),
+        }
+
+    def plan_split_migration(
+        self, split_id: str, downstream_field_ids: Iterable[str]
+    ) -> dict[str, Any]:
+        """Preview a scope and detect shared-chain/parallel-draft conflicts."""
+
+        split = self._require_field_split(split_id)
+        scope = sorted(set(downstream_field_ids))
+        if not scope:
+            raise ValidationError("migration scope must not be empty")
+        for field_id in scope:
+            self._require_field(field_id)
+        edges = [
+            edge
+            for edge in self._active_old_edges(split)
+            if edge.target_field_id in scope
+        ]
+        decisions = [split.decisions[edge.id] for edge in edges if edge.id in split.decisions]
+        unresolved = [
+            {
+                "transform_id": edge.transform_id,
+                "old_field_id": edge.source_field_id,
+                "target_field_id": edge.target_field_id,
+                "reason": "no explicit split decision",
+            }
+            for edge in edges
+            if edge.id not in split.decisions
+        ]
+        unresolved.extend(
+            {
+                "transform_id": item["transform_id"],
+                "old_field_id": item["old_field_id"],
+                "target_field_id": item["target_field_id"],
+                "reason": item.get("reason", "manual interpretation required"),
+            }
+            for item in decisions
+            if item.get("status") == "manual"
+        )
+
+        conflicts: list[dict[str, Any]] = []
+        effective = self._effective_edges()
+        outgoing: dict[str, list[Contribution]] = defaultdict(list)
+        for edge in effective.values():
+            outgoing[edge.source_field_id].append(edge)
+        selected = {
+            edge.id: split.decisions[edge.id]
+            for edge in edges
+            if split.decisions.get(edge.id, {}).get("status") == "explicit"
+        }
+        for edge_id, decision in sorted(selected.items()):
+            target = decision["target_field_id"]
+            if decision.get("new_target_field_id") is not None:
+                continue
+            affected_consumers: list[str] = []
+            queue = deque(item.target_field_id for item in outgoing.get(target, []))
+            seen: set[str] = set()
+            while queue:
+                consumer = queue.popleft()
+                if consumer in seen:
+                    continue
+                seen.add(consumer)
+                if consumer not in scope:
+                    affected_consumers.append(consumer)
+                queue.extend(item.target_field_id for item in outgoing.get(consumer, []))
+            affected_consumers.sort()
+            if affected_consumers:
+                conflicts.append(
+                    {
+                        "id": f"split-conflict:{split.id}:shared:{target}",
+                        "type": "shared_intermediate",
+                        "transform_id": decision["transform_id"],
+                        "old_field_id": split.old_field_id,
+                        "new_field_id": decision["new_field_id"],
+                        "intermediate_field_id": target,
+                        "affected_chain": [target, *sorted(affected_consumers)],
+                        "message": "migrate the shared result itself or provide a new path",
+                    }
+                )
+
+        scope_set = set(scope)
+        for draft in self.store.drafts.values():
+            if draft.status != "open" or draft.metadata.get("split_id") != split.id:
+                continue
+            for staged in draft.transforms:
+                for mapping in staged.mappings:
+                    target = mapping["target_field_id"]
+                    if mapping.get("source_field_id") in split.new_field_ids and target in scope_set:
+                        conflicts.append(
+                            {
+                                "id": f"split-conflict:{split.id}:draft:{draft.id}:{target}",
+                                "type": "parallel_draft",
+                                "draft_id": draft.id,
+                                "new_field_id": mapping["source_field_id"],
+                                "target_field_id": target,
+                                "affected_chain": self._impact_field_chain(
+                                    target, downstream=True
+                                ),
+                            }
+                        )
+        return {
+            "split_id": split.id,
+            "scope": scope,
+            "selected_decisions": [decision for _, decision in sorted(selected.items())],
+            "unresolved": unresolved,
+            "conflicts": conflicts,
+        }
+
+    def create_split_migration_batch(
+        self,
+        batch_id: str,
+        split_id: str,
+        downstream_field_ids: Iterable[str],
+        *,
+        additional_paths: Iterable[dict[str, str]] | None = None,
+        note: str | None = None,
+    ) -> MigrationBatch:
+        """Create an independently reviewable draft for one downstream scope."""
+
+        if batch_id in self.store.migration_batches:
+            raise AlreadyExistsError(f"migration batch '{batch_id}' already exists")
+        draft_id = f"draft.split-migration:{batch_id}"
+        split = self._require_field_split(split_id)
+        plan = self.plan_split_migration(split_id, downstream_field_ids)
+        if plan["unresolved"]:
+            raise ValidationError("migration scope contains undecided dependencies")
+        if plan["conflicts"]:
+            raise ValidationError(
+                "migration scope has conflicts; call plan_split_migration for details"
+            )
+
+        draft = self.create_draft(
+            draft_id,
+            f"Split migration {batch_id}",
+            metadata={
+                "kind": "split_migration",
+                "split_id": split.id,
+                "migration_batch_id": batch_id,
+                "note": note,
+            },
+        )
+        effective = self._effective_edges()
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for edge in effective.values():
+            grouped[edge.transform_id].append(
+                {
+                    "source_field_id": edge.source_field_id,
+                    "target_field_id": edge.target_field_id,
+                    "expression": edge.expression,
+                }
+            )
+
+        decisions = plan["selected_decisions"]
+        selected_edge_ids = {
+            self._contribution_id(
+                item["transform_id"],
+                item["old_field_id"],
+                item["target_field_id"],
+            )
+            for item in decisions
+            if item.get("new_target_field_id") is None
+        }
+        affected_transforms = {item["transform_id"] for item in decisions}
+        new_by_key: set[tuple[str, str, str]] = set()
+        for item in decisions:
+            new_target = item.get("new_target_field_id") or item["target_field_id"]
+            new_by_key.add((item["transform_id"], item["new_field_id"], new_target))
+
+        for path in additional_paths or []:
+            transform_id = path["transform_id"]
+            source_id = path["source_field_id"]
+            target_id = path["target_field_id"]
+            self._check_mapping_fields(source_id, target_id)
+            affected_transforms.add(transform_id)
+            new_by_key.add((transform_id, source_id, target_id))
+        replacement_targets: dict[str, set[str]] = defaultdict(set)
+        for path in additional_paths or []:
+            replacement_targets[path["transform_id"]].add(path["target_field_id"])
+
+        for transform_id in sorted(affected_transforms):
+            transform = self.store.transforms[transform_id]
+            retained = [
+                mapping
+                for mapping in grouped.get(transform_id, [])
+                if self._contribution_id(
+                    transform_id,
+                    mapping["source_field_id"],
+                    mapping["target_field_id"],
+                )
+                not in selected_edge_ids
+                and mapping["target_field_id"] not in replacement_targets.get(transform_id, set())
+            ]
+            for staged_transform, source_id, target_id in sorted(new_by_key):
+                if staged_transform != transform_id:
+                    continue
+                expression = None
+                source_decision = next(
+                    (
+                        item
+                        for item in decisions
+                        if item["transform_id"] == transform_id
+                        and item["new_field_id"] == source_id
+                        and (
+                            item.get("new_target_field_id") or item["target_field_id"]
+                        )
+                        == target_id
+                    ),
+                    None,
+                )
+                source_edge = None
+                if source_decision is not None:
+                    source_edge = effective.get(
+                        self._contribution_id(
+                            transform_id,
+                            split.old_field_id,
+                            source_decision["target_field_id"],
+                        )
+                    )
+                explicit_path = next(
+                    (
+                        item
+                        for item in (additional_paths or [])
+                        if item["transform_id"] == transform_id
+                        and item["source_field_id"] == source_id
+                        and item["target_field_id"] == target_id
+                    ),
+                    None,
+                )
+                if explicit_path is not None:
+                    expression = explicit_path.get("expression")
+                elif source_edge is not None:
+                    expression = source_edge.expression
+                retained.append(
+                    {
+                        "source_field_id": source_id,
+                        "target_field_id": target_id,
+                        "expression": expression,
+                    }
+                )
+            draft.transforms.append(
+                DraftMapping(
+                    transform_id=transform_id,
+                    name=transform.name,
+                    version=transform.version,
+                    code_ref=transform.code_ref,
+                    description=transform.description,
+                    mappings=retained,
+                )
+            )
+
+        before_sources = self._target_sources(effective.values())
+        simulated, _ = self._simulate_changes(effective, set(), draft.transforms)
+        after_sources = self._target_sources(simulated.values())
+        current_cycles = {tuple(c) for c in self._graph_cycles(effective.values())}
+        new_cycles = [
+            cycle
+            for cycle in self._graph_cycles(simulated.values())
+            if tuple(cycle) not in current_cycles
+        ]
+        if new_cycles:
+            draft.status = "discarded"
+            self.store.save()
+            raise ValidationError("migration would introduce a new graph cycle")
+        draft.migration_changes = [dict(item) for item in decisions]
+        comparison = {
+            "before": {
+                target: sorted(before_sources.get(target, set()))
+                for target in plan["scope"]
+            },
+            "after": {
+                target: sorted(after_sources.get(target, set()))
+                for target in plan["scope"]
+            },
+        }
+        batch = MigrationBatch(
+            id=batch_id,
+            split_id=split.id,
+            draft_id=draft_id,
+            scope=plan["scope"],
+            decisions=[dict(item) for item in decisions],
+            source_comparison=comparison,
+            metadata={"note": note},
+        )
+        draft.metadata["migration_batch_id"] = batch_id
+        self.store.migration_batches[batch_id] = batch
+        self.store.save()
+        return batch
+
+    @staticmethod
+    def _target_sources(edges: Iterable[Contribution]) -> dict[str, set[str]]:
+        sources: dict[str, set[str]] = defaultdict(set)
+        for edge in edges:
+            sources[edge.target_field_id].add(edge.source_field_id)
+        return dict(sources)
+
+    def _migration_dependency_resources(self, batch: MigrationBatch) -> set[str]:
+        resources = set(batch.scope)
+        for decision in batch.decisions:
+            resources.add(decision["target_field_id"])
+            resources.add(decision.get("new_target_field_id") or decision["target_field_id"])
+        return {item for item in resources if item}
+
+    def migration_batch(self, batch_id: str) -> MigrationBatch:
+        try:
+            return self.store.migration_batches[batch_id]
+        except KeyError:
+            raise NotFoundError(f"migration batch '{batch_id}' does not exist") from None
+
+    def create_split_retirement_draft(
+        self, split_id: str, draft_id: str | None = None
+    ) -> DraftProposal:
+        """Stage old-field retirement only after every real dependency is handled."""
+
+        split = self._require_field_split(split_id)
+        report = self.split_report(split_id)
+        if report["remaining_old_dependency_count"]:
+            raise ValidationError(
+                "old field still has undecided or manual active dependencies"
+            )
+        draft_id = draft_id or f"draft.split-retire:{split_id}"
+        draft = self.create_draft(
+            draft_id,
+            f"Retire {split.old_field_id}",
+            metadata={"kind": "split_retirement", "split_id": split.id},
+        )
+        self.stage_field_deletion(draft.id, split.old_field_id)
+        return draft
 
     # --- Draft proposals -------------------------------------------------
 
@@ -1504,6 +2047,17 @@ class LineageService:
                 self._check_mapping_fields(
                     mapping["source_field_id"], mapping["target_field_id"]
                 )
+        migration_batch: MigrationBatch | None = None
+        if draft.metadata.get("kind") == "split_migration":
+            batch_id = draft.metadata.get("migration_batch_id")
+            migration_batch = self.migration_batch(batch_id)
+            if migration_batch.draft_id != draft_id:
+                raise ValidationError("migration draft does not match its batch")
+            if migration_batch.status != "planned":
+                raise ValidationError(f"migration batch '{batch_id}' is {migration_batch.status}")
+            diff = self.draft_diff(draft_id)
+            if diff.new_cycles:
+                raise ValidationError("migration would introduce a new graph cycle")
 
         backup_transforms = dict(self.store.transforms)
         backup_contributions = {
@@ -1512,6 +2066,14 @@ class LineageService:
         }
         backup_fields = {
             key: Field(**item.to_dict()) for key, item in self.store.fields.items()
+        }
+        backup_batches = {
+            key: MigrationBatch(**item.to_dict())
+            for key, item in self.store.migration_batches.items()
+        }
+        backup_splits = {
+            key: FieldSplit(**item.to_dict())
+            for key, item in self.store.field_splits.items()
         }
         backup_revision = self.store.revision
         activated: list[str] = []
@@ -1573,6 +2135,22 @@ class LineageService:
                     deactivated_fields.append(field_id)
             self.store.revision += 1
             draft.status = "published"
+            published_at = datetime.now(timezone.utc).isoformat()
+            migration_batch_id = None
+            if migration_batch is not None:
+                migration_batch.status = "published"
+                migration_batch.history_id = (
+                    f"history:r{self.store.revision}:publish:{draft_id}"
+                )
+                migration_batch.published_at = published_at
+                migration_batch.adopted_decisions = [
+                    dict(item) for item in migration_batch.decisions
+                ]
+                migration_batch_id = migration_batch.id
+            retirement_split_id = None
+            if draft.metadata.get("kind") == "split_retirement":
+                retirement_split_id = draft.metadata.get("split_id")
+                self._require_field_split(retirement_split_id).status = "retired"
             entry = HistoryEntry(
                 id=f"history:r{self.store.revision}:publish:{draft_id}",
                 revision=self.store.revision,
@@ -1583,6 +2161,8 @@ class LineageService:
                 deactivated=deactivated,
                 deactivated_fields=deactivated_fields,
                 created_transforms=created_transforms,
+                migration_batch_id=migration_batch_id,
+                created_at=published_at,
                 snapshot=self._graph_snapshot(),
             )
             self.store.history.append(entry)
@@ -1591,6 +2171,8 @@ class LineageService:
             self.store.transforms = backup_transforms
             self.store.contributions = backup_contributions
             self.store.fields = backup_fields
+            self.store.migration_batches = backup_batches
+            self.store.field_splits = backup_splits
             self.store.revision = backup_revision
             draft.status = "open"
             self.store.history = [
@@ -1598,6 +2180,18 @@ class LineageService:
             ]
             raise
         return entry
+
+    def publish_split_migration_batch(
+        self,
+        batch_id: str,
+        *,
+        confirm_stale: bool = False,
+        note: str | None = None,
+    ) -> HistoryEntry:
+        batch = self.migration_batch(batch_id)
+        return self.publish_draft(
+            batch.draft_id, confirm_stale=confirm_stale, note=note
+        )
 
     def withdraw_publish(
         self, history_id: str, *, note: str | None = None
@@ -1621,13 +2215,38 @@ class LineageService:
             (
                 item
                 for item in self.store.history
-                if item.action == "withdraw" and item.draft_id == original.draft_id
-                and item.note == f"withdraw:{original.id}"
+                if item.action == "withdraw"
+                and item.draft_id == original.draft_id
+                and (
+                    item.note == f"withdraw:{original.id}"
+                    or (
+                        item.activated == list(original.deactivated)
+                        and item.deactivated == list(original.activated)
+                    )
+                )
             ),
             None,
         )
         if already is not None:
             raise ValidationError(f"publish '{history_id}' was already withdrawn")
+
+        withdrawn_notes = {
+            f"withdraw:{item.id}"
+            for item in self.store.history
+            if item.action == "withdraw"
+        }
+
+        def edge_active_after_withdrawal(edge_id: str, active_in_original: bool) -> bool:
+            for later in self.store.history:
+                if later.action != "publish" or later.id == original.id:
+                    continue
+                if f"withdraw:{later.id}" in withdrawn_notes:
+                    continue
+                if edge_id in later.activated:
+                    return True
+                if edge_id in later.deactivated:
+                    return False
+            return not active_in_original
 
         backup_transforms = dict(self.store.transforms)
         backup_contributions = {
@@ -1635,15 +2254,23 @@ class LineageService:
             for key, item in self.store.contributions.items()
         }
         backup_revision = self.store.revision
+        backup_batches = {
+            key: MigrationBatch(**item.to_dict())
+            for key, item in self.store.migration_batches.items()
+        }
+        backup_splits = {
+            key: FieldSplit(**item.to_dict())
+            for key, item in self.store.field_splits.items()
+        }
         try:
             for edge_id in original.activated:
                 edge = self.store.contributions.get(edge_id)
                 if edge is not None:
-                    edge.active = False
+                    edge.active = edge_active_after_withdrawal(edge_id, True)
             for edge_id in original.deactivated:
                 edge = self.store.contributions.get(edge_id)
                 if edge is not None:
-                    edge.active = True
+                    edge.active = edge_active_after_withdrawal(edge_id, False)
             for transform_id in original.created_transforms:
                 transform = self.store.transforms.get(transform_id)
                 if transform is not None:
@@ -1652,7 +2279,13 @@ class LineageService:
                 field_item = self.store.fields.get(field_id)
                 if field_item is not None:
                     field_item.active = True
+            withdrawn_batch = (
+                self.store.migration_batches.get(original.migration_batch_id)
+                if original.migration_batch_id
+                else None
+            )
             self.store.revision += 1
+            withdrawn_at = datetime.now(timezone.utc).isoformat()
             entry = HistoryEntry(
                 id=f"history:r{self.store.revision}:withdraw:{original.draft_id}",
                 revision=self.store.revision,
@@ -1661,13 +2294,49 @@ class LineageService:
                 note=f"withdraw:{original.id}" if note is None else note,
                 activated=list(original.deactivated),
                 deactivated=list(original.activated),
+                migration_batch_id=original.migration_batch_id,
+                created_at=withdrawn_at,
                 snapshot=self._graph_snapshot(),
             )
             self.store.history.append(entry)
+            if withdrawn_batch is not None:
+                withdrawn_batch.status = "withdrawn"
+                withdrawn_batch.requires_recheck = False
+                withdrawn_batch.recheck_reasons = []
+                withdrawn_resources = self._migration_dependency_resources(
+                    withdrawn_batch
+                )
+                for later in self.store.migration_batches.values():
+                    if (
+                        later.id == withdrawn_batch.id
+                        or later.split_id != withdrawn_batch.split_id
+                    ):
+                        continue
+                    later_resources = self._migration_dependency_resources(later)
+                    later_sources = {
+                        source
+                        for sources in later.source_comparison.get("after", {}).values()
+                        for source in sources
+                    }
+                    if withdrawn_resources & later_resources or withdrawn_resources & later_sources:
+                        later.requires_recheck = True
+                        reason = f"upstream batch '{withdrawn_batch.id}' was withdrawn"
+                        if reason not in later.recheck_reasons:
+                            later.recheck_reasons.append(reason)
+            for split in self.store.field_splits.values():
+                draft = self.store.drafts.get(original.draft_id or "")
+                if (
+                    split.id == draft.metadata.get("split_id")
+                    and draft.metadata.get("kind") == "split_retirement"
+                    and split.status == "retired"
+                ):
+                    split.status = "open"
             self.store.save()
         except Exception:
             self.store.transforms = backup_transforms
             self.store.contributions = backup_contributions
+            self.store.migration_batches = backup_batches
+            self.store.field_splits = backup_splits
             self.store.revision = backup_revision
             raise
         return entry

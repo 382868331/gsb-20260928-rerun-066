@@ -185,6 +185,48 @@ def build_parser() -> argparse.ArgumentParser:
     abandon_merge = subparsers.add_parser("abandon-merge")
     abandon_merge.add_argument("session_id")
 
+    split = subparsers.add_parser("create-field-split")
+    split.add_argument("id")
+    split.add_argument("old_field_id")
+    split.add_argument("new_field_id", nargs="+")
+
+    split_decision = subparsers.add_parser("record-split-decision")
+    split_decision.add_argument("split_id")
+    split_decision.add_argument("transform_id")
+    split_decision.add_argument("target_field_id")
+    split_decision.add_argument("new_field_id")
+    split_decision.add_argument("--new-target-field-id")
+    split_decision.add_argument("--rationale")
+
+    split_manual = subparsers.add_parser("record-split-manual")
+    split_manual.add_argument("split_id")
+    split_manual.add_argument("transform_id")
+    split_manual.add_argument("target_field_id")
+    split_manual.add_argument("reason")
+
+    split_report = subparsers.add_parser("split-report")
+    split_report.add_argument("split_id")
+
+    split_plan = subparsers.add_parser("plan-split-migration")
+    split_plan.add_argument("split_id")
+    split_plan.add_argument("downstream_field_id", nargs="+")
+
+    split_batch = subparsers.add_parser("create-split-batch")
+    split_batch.add_argument("batch_id")
+    split_batch.add_argument("split_id")
+    split_batch.add_argument("downstream_field_id", nargs="+")
+    split_batch.add_argument("--note")
+    split_batch.add_argument("--additional-paths")
+
+    split_publish = subparsers.add_parser("publish-split-batch")
+    split_publish.add_argument("batch_id")
+    split_publish.add_argument("--confirm-stale", action="store_true")
+    split_publish.add_argument("--note")
+
+    split_retire = subparsers.add_parser("create-split-retirement")
+    split_retire.add_argument("split_id")
+    split_retire.add_argument("--draft-id")
+
     withdraw = subparsers.add_parser("withdraw-publish")
     withdraw.add_argument("history_id")
     withdraw.add_argument("--note")
@@ -192,7 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("history")
 
     list_items = subparsers.add_parser("list")
-    list_items.add_argument("kind", choices=["objects", "fields", "transforms", "contributions", "drafts"])
+    list_items.add_argument("kind", choices=["objects", "fields", "transforms", "contributions", "drafts", "field-splits", "migration-batches"])
     return parser
 
 
@@ -323,6 +365,62 @@ def main(argv: list[str] | None = None) -> None:
         session = service.abandon_merge(args.session_id)
         print(json.dumps(session.to_dict(), ensure_ascii=False, indent=2))
         return
+    elif args.command == "create-field-split":
+        result = service.create_field_split(
+            args.id, args.old_field_id, args.new_field_id
+        )
+    elif args.command == "record-split-decision":
+        result = service.record_split_decision(
+            args.split_id,
+            args.transform_id,
+            args.target_field_id,
+            args.new_field_id,
+            new_target_field_id=args.new_target_field_id,
+            rationale=args.rationale,
+        )
+    elif args.command == "record-split-manual":
+        result = service.record_manual_split_dependency(
+            args.split_id,
+            args.transform_id,
+            args.target_field_id,
+            args.reason,
+        )
+    elif args.command == "split-report":
+        print(json.dumps(service.split_report(args.split_id), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "plan-split-migration":
+        print(
+            json.dumps(
+                service.plan_split_migration(
+                    args.split_id, args.downstream_field_id
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    elif args.command == "create-split-batch":
+        result = service.create_split_migration_batch(
+            args.batch_id,
+            args.split_id,
+            args.downstream_field_id,
+            additional_paths=json.loads(args.additional_paths)
+            if args.additional_paths
+            else None,
+            note=args.note,
+        )
+    elif args.command == "publish-split-batch":
+        result = service.publish_split_migration_batch(
+            args.batch_id,
+            confirm_stale=args.confirm_stale,
+            note=args.note,
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "create-split-retirement":
+        result = service.create_split_retirement_draft(
+            args.split_id, args.draft_id
+        )
     elif args.command == "withdraw-publish":
         print(json.dumps(service.withdraw_publish(args.history_id, note=args.note).to_dict(), ensure_ascii=False, indent=2))
         return
@@ -338,6 +436,10 @@ def main(argv: list[str] | None = None) -> None:
             payload = [_transform_dict(x) for x in service.store.transforms.values()]
         elif args.kind == "drafts":
             payload = [x.to_dict() for x in service.store.drafts.values()]
+        elif args.kind == "field-splits":
+            payload = [x.to_dict() for x in service.store.field_splits.values()]
+        elif args.kind == "migration-batches":
+            payload = [x.to_dict() for x in service.store.migration_batches.values()]
         else:
             payload = [_contribution_dict(service, x) for x in service.store.contributions.values()]
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -351,8 +453,10 @@ def main(argv: list[str] | None = None) -> None:
         payload = _transform_dict(result)
     elif isinstance(result, DataObject):
         payload = _object_dict(result)
-    else:
+    elif isinstance(result, Field):
         payload = _field_dict(result)
+    else:
+        payload = result.to_dict()
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 

@@ -108,6 +108,7 @@ class DraftProposal:
     status: str = "open"  # open | published | discarded
     transforms: list[DraftMapping] = field(default_factory=list)
     deleted_fields: list[str] = field(default_factory=list)
+    migration_changes: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=_new_metadata)
 
     def to_dict(self) -> dict[str, Any]:
@@ -198,6 +199,8 @@ class HistoryEntry:
     deactivated: list[str] = field(default_factory=list)
     deactivated_fields: list[str] = field(default_factory=list)
     created_transforms: list[str] = field(default_factory=list)
+    migration_batch_id: str | None = None
+    created_at: str | None = None
     snapshot: dict[str, Any] = field(default_factory=_new_metadata)
 
     def to_dict(self) -> dict[str, Any]:
@@ -205,4 +208,50 @@ class HistoryEntry:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "HistoryEntry":
+        return cls(**data)
+
+
+@dataclass(slots=True)
+class FieldSplit:
+    """A reviewed proposal for splitting one old field into explicit fields."""
+
+    id: str
+    old_field_id: str
+    new_field_ids: list[str]
+    base_revision: int
+    status: str = "open"  # open | retired | discarded
+    decisions: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=_new_metadata)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "FieldSplit":
+        return cls(**data)
+
+
+@dataclass(slots=True)
+class MigrationBatch:
+    """A downstream-scoped set of field-split decisions published together."""
+
+    id: str
+    split_id: str
+    draft_id: str
+    scope: list[str]
+    decisions: list[dict[str, Any]] = field(default_factory=list)
+    status: str = "planned"  # planned | published | withdrawn
+    history_id: str | None = None
+    published_at: str | None = None
+    adopted_decisions: list[dict[str, Any]] = field(default_factory=list)
+    source_comparison: dict[str, Any] = field(default_factory=_new_metadata)
+    requires_recheck: bool = False
+    recheck_reasons: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=_new_metadata)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MigrationBatch":
         return cls(**data)

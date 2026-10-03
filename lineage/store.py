@@ -9,8 +9,10 @@ from .models import (
     Contribution,
     DataObject,
     DraftProposal,
+    FieldSplit,
     Field,
     HistoryEntry,
+    MigrationBatch,
     MergeSession,
     TransformVersion,
 )
@@ -30,6 +32,8 @@ class JsonLineageStore:
         self.transforms: dict[str, TransformVersion] = {}
         self.contributions: dict[str, Contribution] = {}
         self.drafts: dict[str, DraftProposal] = {}
+        self.field_splits: dict[str, FieldSplit] = {}
+        self.migration_batches: dict[str, MigrationBatch] = {}
         self.merge_sessions: dict[str, MergeSession] = {}
         self.history: list[HistoryEntry] = []
         self.revision: int = 0
@@ -59,6 +63,14 @@ class JsonLineageStore:
             item["id"]: DraftProposal.from_dict(item)
             for item in raw.get("drafts", [])
         }
+        self.field_splits = {
+            item["id"]: FieldSplit.from_dict(item)
+            for item in raw.get("field_splits", [])
+        }
+        self.migration_batches = {
+            item["id"]: MigrationBatch.from_dict(item)
+            for item in raw.get("migration_batches", [])
+        }
         self.merge_sessions = {
             item["id"]: MergeSession.from_dict(item)
             for item in raw.get("merge_sessions", [])
@@ -78,6 +90,10 @@ class JsonLineageStore:
                 item.to_dict() for item in self.contributions.values()
             ],
             "drafts": [item.to_dict() for item in self.drafts.values()],
+            "field_splits": [item.to_dict() for item in self.field_splits.values()],
+            "migration_batches": [
+                item.to_dict() for item in self.migration_batches.values()
+            ],
             "merge_sessions": [
                 item.to_dict() for item in self.merge_sessions.values()
             ],
