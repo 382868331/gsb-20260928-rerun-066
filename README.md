@@ -31,6 +31,10 @@
 - 历史快照：每次发布与撤回都追加一条 `HistoryEntry`，内含发布前完整图快照；批量校验失败或保存中断时内存与磁盘整体回滚，历史图保持完整。
 - 发布撤回：`withdraw_publish(history_id)` 软删除该次发布启用的边并恢复其停用的边，撤回本身也作为历史条目永久保留。
 
+- 显式字段拆分：create_field_split 仅建立旧字段到候选新字段的独立草稿；每条旧来源可达依赖必须由人标记为 keep_old、use_new 或 manual，采用新字段时必须记录解释，不会因名称相近自动等价。
+- 分批迁移：create_split_migration_batch / publish_split_migration_batch 按下游范围发布；同一正式图中可同时保留读旧字段的路径和采用新解释的路径。共享中间结果若会无声影响未迁移使用者会被拒绝，可通过独立新路径只切换明确采用的消费者。
+- 拆分撤回与退出：撤回批次保留原采用解释和发布时间，并标记依赖该决定的后续批次重新核对；旧字段只有在没有实际可达依赖和未处置决定时，才可通过 retire_split_old_field 退出。
+
 ## Python API
 
 ```python
@@ -107,6 +111,26 @@ entry = service.publish_merge("merge.20261002", confirm_stale=True)
 # 发布后撤回，历史条目与图快照全部保留
 service.withdraw_publish(entry.id)
 service.history()
+
+service.create_field_split(
+    "split.contact",
+    "raw.v1.contact",
+    ["raw.v2.billing_contact", "raw.v2.support_contact"],
+)
+service.decide_field_split_dependency(
+    "split.contact", "t.customer", "dim_customer.contact", "use_new",
+    new_field_id="raw.v2.billing_contact",
+    interpretation="dim_customer.contact stores billing contact only",
+)
+service.create_split_migration_batch(
+    "split.contact", "batch.customer",
+    [("t.customer", "dim_customer.contact")],
+)
+entry = service.publish_split_migration_batch(
+    "split.contact", "batch.customer", note="migrate billing consumer"
+)
+service.withdraw_split_migration_batch("split.contact", "batch.customer")
+service.retire_split_old_field("split.contact")
 ```
 
 建议由提交方生成稳定、可读且全局唯一的 ID，例如：
@@ -140,6 +164,13 @@ python -m lineage.cli --store lineage.json resolve-merge m1 'merge:m1:deleted-fi
 python -m lineage.cli --store lineage.json publish-merge m1 --confirm-stale --note 'release plan'
 python -m lineage.cli --store lineage.json abandon-merge m1
 python -m lineage.cli --store lineage.json withdraw-publish history:r1:publish:d1
+python -m lineage.cli --store lineage.json create-field-split split.contact raw.v1.contact raw.v2.billing_contact raw.v2.support_contact
+python -m lineage.cli --store lineage.json field-split-report split.contact
+python -m lineage.cli --store lineage.json decide-field-split split.contact t.customer dim_customer.contact use_new --new-field raw.v2.billing_contact --interpretation 'billing contact'
+python -m lineage.cli --store lineage.json create-split-batch split.contact batch.customer --dependency t.customer dim_customer.contact
+python -m lineage.cli --store lineage.json publish-split-batch split.contact batch.customer
+python -m lineage.cli --store lineage.json withdraw-split-batch split.contact batch.customer
+python -m lineage.cli --store lineage.json retire-split-old-field split.contact
 python -m lineage.cli --store lineage.json history
 ```
 

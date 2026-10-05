@@ -189,10 +189,57 @@ def build_parser() -> argparse.ArgumentParser:
     withdraw.add_argument("history_id")
     withdraw.add_argument("--note")
 
+    split_create = subparsers.add_parser("create-field-split")
+    split_create.add_argument("plan_id")
+    split_create.add_argument("old_field_id")
+    split_create.add_argument("new_field_id", nargs="+")
+
+    split_report = subparsers.add_parser("field-split-report")
+    split_report.add_argument("plan_id")
+
+    split_decide = subparsers.add_parser("decide-field-split")
+    split_decide.add_argument("plan_id")
+    split_decide.add_argument("transform_id")
+    split_decide.add_argument("target_field_id")
+    split_decide.add_argument("status", choices=["keep_old", "use_new", "manual"])
+    split_decide.add_argument("--source-field")
+    split_decide.add_argument("--new-field")
+    split_decide.add_argument("--interpretation")
+    split_decide.add_argument("--rationale")
+
+    split_batch = subparsers.add_parser("create-split-batch")
+    split_batch.add_argument("plan_id")
+    split_batch.add_argument("batch_id")
+    split_batch.add_argument(
+        "--dependency",
+        action="append",
+        nargs="+",
+        metavar="DEPENDENCY",
+        required=True,
+    )
+
+    split_publish = subparsers.add_parser("publish-split-batch")
+    split_publish.add_argument("plan_id")
+    split_publish.add_argument("batch_id")
+    split_publish.add_argument("--note")
+
+    split_withdraw = subparsers.add_parser("withdraw-split-batch")
+    split_withdraw.add_argument("plan_id")
+    split_withdraw.add_argument("batch_id")
+    split_withdraw.add_argument("--note")
+
+    split_recheck = subparsers.add_parser("recheck-split-batch")
+    split_recheck.add_argument("plan_id")
+    split_recheck.add_argument("batch_id")
+
+    split_retire = subparsers.add_parser("retire-split-old-field")
+    split_retire.add_argument("plan_id")
+    split_retire.add_argument("--note")
+
     subparsers.add_parser("history")
 
     list_items = subparsers.add_parser("list")
-    list_items.add_argument("kind", choices=["objects", "fields", "transforms", "contributions", "drafts"])
+    list_items.add_argument("kind", choices=["objects", "fields", "transforms", "contributions", "drafts", "field-splits"])
     return parser
 
 
@@ -326,6 +373,51 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "withdraw-publish":
         print(json.dumps(service.withdraw_publish(args.history_id, note=args.note).to_dict(), ensure_ascii=False, indent=2))
         return
+    elif args.command == "create-field-split":
+        result = service.create_field_split(
+            args.plan_id, args.old_field_id, args.new_field_id
+        )
+    elif args.command == "field-split-report":
+        print(json.dumps(service.field_split_report(args.plan_id), ensure_ascii=False, indent=2))
+        return
+    elif args.command == "decide-field-split":
+        result = service.decide_field_split_dependency(
+            args.plan_id,
+            args.transform_id,
+            args.target_field_id,
+            args.status,
+            source_field_id=args.source_field,
+            new_field_id=args.new_field,
+            interpretation=args.interpretation,
+            rationale=args.rationale,
+        )
+    elif args.command == "create-split-batch":
+        dependency_keys = []
+        for item in args.dependency:
+            if len(item) == 2:
+                dependency_keys.append(tuple(item))
+            elif len(item) == 3:
+                transform_id, target_field_id, source_field_id = item
+                dependency_keys.append((transform_id, source_field_id, target_field_id))
+            else:
+                parser.error("dependency requires TRANSFORM TARGET [SOURCE]")
+        result = service.create_split_migration_batch(
+            args.plan_id,
+            args.batch_id,
+            dependency_keys,
+        )
+    elif args.command == "publish-split-batch":
+        result = service.publish_split_migration_batch(
+            args.plan_id, args.batch_id, note=args.note
+        )
+    elif args.command == "withdraw-split-batch":
+        result = service.withdraw_split_migration_batch(
+            args.plan_id, args.batch_id, note=args.note
+        )
+    elif args.command == "recheck-split-batch":
+        result = service.recheck_split_migration_batch(args.plan_id, args.batch_id)
+    elif args.command == "retire-split-old-field":
+        result = service.retire_split_old_field(args.plan_id, note=args.note)
     elif args.command == "history":
         print(json.dumps([item.to_dict() for item in service.history()], ensure_ascii=False, indent=2))
         return
@@ -338,6 +430,8 @@ def main(argv: list[str] | None = None) -> None:
             payload = [_transform_dict(x) for x in service.store.transforms.values()]
         elif args.kind == "drafts":
             payload = [x.to_dict() for x in service.store.drafts.values()]
+        elif args.kind == "field-splits":
+            payload = [x.to_dict() for x in service.store.field_splits.values()]
         else:
             payload = [_contribution_dict(service, x) for x in service.store.contributions.values()]
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -345,7 +439,9 @@ def main(argv: list[str] | None = None) -> None:
     else:  # pragma: no cover
         parser.error("unknown command")
 
-    if isinstance(result, Contribution):
+    if hasattr(result, "to_dict"):
+        payload = result.to_dict()
+    elif isinstance(result, Contribution):
         payload = _contribution_dict(service, result)
     elif isinstance(result, TransformVersion):
         payload = _transform_dict(result)

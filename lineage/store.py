@@ -9,6 +9,7 @@ from .models import (
     Contribution,
     DataObject,
     DraftProposal,
+    FieldSplitPlan,
     Field,
     HistoryEntry,
     MergeSession,
@@ -31,6 +32,7 @@ class JsonLineageStore:
         self.contributions: dict[str, Contribution] = {}
         self.drafts: dict[str, DraftProposal] = {}
         self.merge_sessions: dict[str, MergeSession] = {}
+        self.field_splits: dict[str, FieldSplitPlan] = {}
         self.history: list[HistoryEntry] = []
         self.revision: int = 0
         if self.path.exists():
@@ -63,6 +65,10 @@ class JsonLineageStore:
             item["id"]: MergeSession.from_dict(item)
             for item in raw.get("merge_sessions", [])
         }
+        self.field_splits = {
+            item["id"]: FieldSplitPlan.from_dict(item)
+            for item in raw.get("field_splits", [])
+        }
         self.history = [
             HistoryEntry.from_dict(item) for item in raw.get("history", [])
         ]
@@ -81,6 +87,7 @@ class JsonLineageStore:
             "merge_sessions": [
                 item.to_dict() for item in self.merge_sessions.values()
             ],
+            "field_splits": [item.to_dict() for item in self.field_splits.values()],
             "history": [item.to_dict() for item in self.history],
             "revision": self.revision,
         }

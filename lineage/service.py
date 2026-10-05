@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 from typing import Any, Iterable
 
@@ -17,6 +18,9 @@ from .models import (
     DraftMapping,
     DraftProposal,
     Field,
+    FieldSplitBatch,
+    FieldSplitDecision,
+    FieldSplitPlan,
     HistoryEntry,
     MergeConflict,
     MergeDecision,
@@ -576,6 +580,602 @@ class LineageService:
             return self.store.objects[object_id]
         except KeyError:
             raise NotFoundError(f"data object '{object_id}' does not exist") from None
+
+    # --- Explicit field splits ------------------------------------------
+
+    @staticmethod
+    def _utc_now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def create_field_split(
+        self,
+        plan_id: str,
+        old_field_id: str,
+        new_field_ids: Iterable[str],
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> FieldSplitPlan:
+        if plan_id in self.store.field_splits:
+            raise AlreadyExistsError(f"field split plan '{plan_id}' already exists")
+        self._require_field(old_field_id)
+        new_field_ids = list(new_field_ids)
+        if not new_field_ids:
+            raise ValidationError("a field split must introduce at least one new field")
+        if len(new_field_ids) != len(set(new_field_ids)):
+            raise ValidationError("new fields in a split must be unique")
+        for new_field_id in new_field_ids:
+            field_item = self._require_field(new_field_id)
+            if not field_item.active:
+                raise ValidationError(f"new field '{new_field_id}' is deleted")
+            if new_field_id == old_field_id:
+                raise ValidationError("a split new field cannot be the old field")
+        plan = FieldSplitPlan(
+            id=plan_id,
+            old_field_id=old_field_id,
+            new_field_ids=list(new_field_ids),
+            base_revision=self.store.revision,
+            metadata=metadata or {},
+        )
+        self.store.field_splits[plan_id] = plan
+        self.store.save()
+        return plan
+
+    def _require_field_split(self, plan_id: str) -> FieldSplitPlan:
+        try:
+            return self.store.field_splits[plan_id]
+        except KeyError:
+            raise NotFoundError(f"field split plan '{plan_id}' does not exist") from None
+
+    @staticmethod
+    def _decision_key(transform_id: str, source_id: str, target_id: str) -> tuple[str, str, str]:
+        return transform_id, source_id, target_id
+
+    def _split_active_dependencies(self, plan: FieldSplitPlan) -> dict[tuple[str, str, str], Contribution]:
+        edges = self._effective_edges()
+        outgoing: dict[str, list[Contribution]] = defaultdict(list)
+        for edge in edges.values():
+            outgoing[edge.source_field_id].append(edge)
+        queue = deque(outgoing[plan.old_field_id])
+        dependencies: dict[tuple[str, str, str], Contribution] = {}
+        while queue:
+            edge = queue.popleft()
+            key = self._decision_key(edge.transform_id, edge.source_field_id, edge.target_field_id)
+            if key in dependencies:
+                continue
+            dependencies[key] = edge
+            queue.extend(outgoing[edge.target_field_id])
+        return dependencies
+
+    def _split_decision_map(self, plan: FieldSplitPlan) -> dict[tuple[str, str, str], FieldSplitDecision]:
+        return {
+            self._decision_key(item.transform_id, item.source_field_id, item.target_field_id): item
+            for item in plan.decisions
+        }
+
+    def field_split_report(self, plan_id: str) -> dict[str, Any]:
+        plan = self._require_field_split(plan_id)
+        active = self._split_active_dependencies(plan)
+        decisions = self._split_decision_map(plan)
+        legacy = []
+        explicit = []
+        manual = []
+        recheck = []
+        unhandled = []
+        for key in sorted(active):
+            edge = active[key]
+            decision = decisions.get(key)
+            impact = self.impact(edge.target_field_id)
+            item = {
+                "transform_id": edge.transform_id,
+                "source_field_id": edge.source_field_id,
+                "target_field_id": edge.target_field_id,
+                "expression": edge.expression,
+                "downstream": sorted(impact.direct),
+                "transitive_downstream": sorted(impact.transitive),
+            }
+            if decision is None:
+                unhandled.append(item)
+            elif decision.status == "keep_old":
+                legacy.append({**item, "decision": decision.to_dict()})
+            elif decision.status == "use_new":
+                explicit.append({**item, "decision": decision.to_dict()})
+            elif decision.status == "recheck":
+                recheck.append({**item, "decision": decision.to_dict()})
+            else:
+                manual.append({**item, "decision": decision.to_dict()})
+        stale = [
+            decision.to_dict()
+            for decision in plan.decisions
+            if self._decision_key(
+                decision.transform_id, decision.source_field_id, decision.target_field_id
+            )
+            not in active
+        ]
+        return {
+            "plan_id": plan.id,
+            "old_field_id": plan.old_field_id,
+            "new_field_ids": list(plan.new_field_ids),
+            "status": plan.status,
+            "base_revision": plan.base_revision,
+            "current_revision": self.store.revision,
+            "stale": plan.base_revision != self.store.revision,
+            "legacy_dependencies": legacy,
+            "new_field_dependencies": explicit,
+            "recheck_dependencies": recheck,
+            "manual_review_dependencies": manual,
+            "unhandled_dependencies": unhandled,
+            "obsolete_decisions": stale,
+            "batches": [batch.to_dict() for batch in plan.batches],
+        }
+
+    def decide_field_split_dependency(
+        self,
+        plan_id: str,
+        transform_id: str,
+        target_field_id: str,
+        status: str,
+        *,
+        source_field_id: str | None = None,
+        new_field_id: str | None = None,
+        interpretation: str | None = None,
+        rationale: str | None = None,
+    ) -> FieldSplitDecision:
+        plan = self._require_field_split(plan_id)
+        if plan.status != "open":
+            raise ValidationError(f"field split plan '{plan_id}' is {plan.status}")
+        if status not in {"keep_old", "use_new", "manual"}:
+            raise ValidationError("status must be keep_old, use_new, or manual")
+        source_field_id = source_field_id or plan.old_field_id
+        key = self._decision_key(transform_id, source_field_id, target_field_id)
+        active = self._split_active_dependencies(plan)
+        if key not in active:
+            raise NotFoundError("the specified dependency is not an active dependency of the old field")
+        edge = active[key]
+        if status == "use_new":
+            if edge.source_field_id == plan.old_field_id:
+                if new_field_id not in plan.new_field_ids:
+                    raise ValidationError("new_field_id must be one explicitly declared by this split plan")
+            elif new_field_id is not None:
+                raise ValidationError("downstream dependencies choose their source through new_paths")
+            if not interpretation:
+                raise ValidationError("use_new requires an explicit interpretation")
+        elif edge.source_field_id == plan.old_field_id and new_field_id is not None:
+            raise ValidationError("only use_new decisions can choose a new field")
+        decision = FieldSplitDecision(
+            transform_id=transform_id,
+            source_field_id=source_field_id,
+            target_field_id=target_field_id,
+            status=status,
+            new_field_id=new_field_id,
+            interpretation=interpretation,
+            rationale=rationale,
+            decided_at=self._utc_now(),
+        )
+        plan.decisions = [
+            item
+            for item in plan.decisions
+            if self._decision_key(item.transform_id, item.source_field_id, item.target_field_id) != key
+        ]
+        plan.decisions.append(decision)
+        self.store.save()
+        return decision
+
+    def create_split_migration_batch(
+        self,
+        plan_id: str,
+        batch_id: str,
+        dependency_keys: Iterable[tuple[str, ...]],
+        *,
+        new_paths: Iterable[DraftMapping] | None = None,
+    ) -> FieldSplitBatch:
+        plan = self._require_field_split(plan_id)
+        if any(batch.id == batch_id for batch in plan.batches):
+            raise AlreadyExistsError(f"split batch '{batch_id}' already exists")
+        if plan.status != "open":
+            raise ValidationError(f"field split plan '{plan_id}' is {plan.status}")
+        active = self._split_active_dependencies(plan)
+        decisions = self._split_decision_map(plan)
+        selected: list[tuple[str, str, str]] = []
+        for item in dependency_keys:
+            if len(item) == 2:
+                transform_id, target_id = item
+                source_id = plan.old_field_id
+            elif len(item) == 3:
+                transform_id, source_id, target_id = item
+            else:
+                raise ValidationError("dependency key must be (transform_id, target_field_id) or (transform_id, source_field_id, target_field_id)")
+            key = self._decision_key(transform_id, source_id, target_id)
+            edge = active.get(key)
+            if edge is None:
+                raise NotFoundError("selected dependency is not an active dependency of the old field")
+            decision = decisions.get(key)
+            if decision is None:
+                raise ValidationError("cannot migrate an undecided dependency")
+            if decision.status != "use_new":
+                raise ValidationError(f"dependency '{key}' is {decision.status}, not explicitly migrated")
+            selected.append(key)
+        if not selected:
+            raise ValidationError("a migration batch must select at least one decided dependency")
+        new_path_transforms = list(new_paths or [])
+        self._validate_new_paths(plan, new_path_transforms)
+        backup_plan = FieldSplitPlan.from_dict(plan.to_dict())
+        backup_drafts = {
+            key: DraftProposal.from_dict(item.to_dict())
+            for key, item in self.store.drafts.items()
+        }
+        batch = FieldSplitBatch(
+            id=batch_id,
+            plan_id=plan_id,
+            dependency_keys=[list(key) for key in selected],
+        )
+        plan.batches.append(batch)
+        try:
+            draft = self._materialize_split_batch(plan, batch, new_path_transforms, save=False)
+            self.store.drafts[draft.id] = draft
+            validation = self._validate_split_batch(plan, batch, draft, save=False)
+            batch.affected_chain = validation["affected_chain"]
+            batch.source_comparison = validation["source_comparison"]
+            batch.adopted = [item.to_dict() for item in draft.transforms]
+            self.store.save()
+        except Exception:
+            self.store.field_splits[plan.id] = backup_plan
+            self.store.drafts = backup_drafts
+            raise
+        return batch
+
+    def _validate_new_paths(self, plan: FieldSplitPlan, staged: Iterable[DraftMapping]) -> None:
+        seen = set()
+        for item in staged:
+            if not item.mappings:
+                raise ValidationError("a new path transform must contribute at least one mapping")
+            key = item.transform_id
+            if key in seen:
+                raise AlreadyExistsError("new paths contain a repeated transform id")
+            seen.add(key)
+            for mapping in item.mappings:
+                source_id = mapping["source_field_id"]
+                target_id = mapping["target_field_id"]
+                self._check_mapping_fields(source_id, target_id)
+                if target_id == plan.old_field_id:
+                    raise ValidationError("new split paths cannot target the old field")
+
+    def _materialize_split_batch(
+        self,
+        plan: FieldSplitPlan,
+        batch: FieldSplitBatch,
+        new_path_transforms: Iterable[DraftMapping],
+        *,
+        save: bool,
+    ) -> DraftProposal:
+        decisions = self._split_decision_map(plan)
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        identity: dict[str, DraftMapping] = {}
+        selected_keys = {tuple(item) for item in batch.dependency_keys}
+        for staged in new_path_transforms:
+            identity[staged.transform_id] = staged
+            grouped[staged.transform_id].extend(staged.mappings)
+        current = self._effective_edges()
+        active_by_transform: dict[str, list[Contribution]] = defaultdict(list)
+        for edge in current.values():
+            active_by_transform[edge.transform_id].append(edge)
+        for key_tuple in selected_keys:
+            decision = decisions[key_tuple]
+            if key_tuple[1] != plan.old_field_id:
+                continue
+            existing = self.store.contributions[
+                self._contribution_id(key_tuple[0], key_tuple[1], key_tuple[2])
+            ]
+            transform = self.store.transforms[key_tuple[0]]
+            identity[key_tuple[0]] = DraftMapping(
+                transform_id=key_tuple[0],
+                name=transform.name,
+                version=transform.version,
+                code_ref=transform.code_ref,
+                description=transform.description,
+            )
+            grouped[key_tuple[0]].append(
+                {
+                    "source_field_id": decision.new_field_id,
+                    "target_field_id": key_tuple[2],
+                    "expression": existing.expression,
+                    "split_interpretation": decision.interpretation,
+                }
+            )
+        for transform_id, edges in active_by_transform.items():
+            if transform_id not in grouped:
+                continue
+            for edge in edges:
+                key = (edge.transform_id, edge.source_field_id, edge.target_field_id)
+                if key in selected_keys:
+                    continue
+                grouped[transform_id].append(
+                    {
+                        "source_field_id": edge.source_field_id,
+                        "target_field_id": edge.target_field_id,
+                        "expression": edge.expression,
+                    }
+                )
+        transforms = []
+        for transform_id in sorted(grouped):
+            base = identity[transform_id]
+            transforms.append(
+                DraftMapping(
+                    transform_id=base.transform_id,
+                    name=base.name,
+                    version=base.version,
+                    code_ref=base.code_ref,
+                    description=base.description,
+                    mappings=grouped[transform_id],
+                )
+            )
+        draft_id = f"split-draft:{plan.id}:{batch.id}"
+        existing_draft = self.store.drafts.get(draft_id)
+        if existing_draft is not None:
+            if save:
+                raise AlreadyExistsError(f"draft '{draft_id}' already exists")
+            existing_draft.transforms = transforms
+            existing_draft.deleted_fields = []
+            existing_draft.status = "open"
+            existing_draft.metadata = {
+                "field_split_plan_id": plan.id,
+                "split_batch_id": batch.id,
+            }
+            return existing_draft
+        return DraftProposal(
+            id=draft_id,
+            name=f"Field split {plan.id} batch {batch.id}",
+            base_revision=self.store.revision,
+            transforms=transforms,
+            metadata={"field_split_plan_id": plan.id, "split_batch_id": batch.id},
+        )
+
+    def _validate_split_batch(
+        self,
+        plan: FieldSplitPlan,
+        batch: FieldSplitBatch,
+        draft: DraftProposal,
+        *,
+        save: bool,
+    ) -> dict[str, Any]:
+        conflicts = self._split_batch_mapping_conflicts(plan, batch, draft)
+        if conflicts:
+            raise ValidationError({"message": "split batch conflicts", "conflicts": conflicts})
+        diff = self.draft_diff(draft.id)
+        if diff.new_cycles:
+            raise ValidationError({"message": "split batch would create a cycle", "new_cycles": diff.new_cycles})
+        removed_keys = {
+            (item["transform_id"], item["source_field_id"], item["target_field_id"])
+            for item in diff.removed_dependencies
+        }
+        for key in {tuple(item) for item in batch.dependency_keys}:
+            if key[1] != plan.old_field_id and key not in removed_keys:
+                raise ValidationError(
+                    {
+                        "message": "downstream migration decision is not disconnected from the old chain",
+                        "dependency": list(key),
+                    }
+                )
+        selected_targets = {tuple(item)[2] for item in batch.dependency_keys}
+        replaced_old_sources = {
+            tuple(item)[2]
+            for item in batch.dependency_keys
+            if tuple(item)[1] == plan.old_field_id
+        }
+        affected_chain: dict[str, Any] = {}
+        for target_id in sorted(replaced_old_sources):
+            impact = self.impact(target_id)
+            downstream = sorted(impact.direct)
+            if downstream:
+                selected_set = set(selected_targets)
+                unselected = [item for item in downstream if item not in selected_set]
+                if unselected:
+                    raise ValidationError(
+                        {
+                            "message": "shared intermediate would silently change downstream users",
+                            "intermediate_field_id": target_id,
+                            "unselected_downstream": unselected,
+                        }
+                    )
+                affected_chain[target_id] = {
+                    "direct_downstream": downstream,
+                    "transitive_downstream": sorted(impact.transitive),
+                }
+        current_edges = self._effective_edges()
+        simulated, _ = self._simulate_changes(current_edges, set(), draft.transforms)
+        affected_targets = selected_targets | {
+            edge.target_field_id
+            for staged in draft.transforms
+            for edge in self.store.contributions.values()
+            if edge.active and edge.transform_id == staged.transform_id
+        }
+        comparison = {}
+        for target_id in sorted(affected_targets):
+            before = sorted({edge.source_field_id for edge in current_edges.values() if edge.target_field_id == target_id})
+            after = sorted({edge.source_field_id for edge in simulated.values() if edge.target_field_id == target_id})
+            if before != after:
+                comparison[target_id] = {"before": before, "after": after}
+        return {"affected_chain": affected_chain, "source_comparison": comparison}
+
+    def _split_batch_mapping_conflicts(
+        self,
+        plan: FieldSplitPlan,
+        batch: FieldSplitBatch,
+        draft: DraftProposal,
+    ) -> list[dict[str, Any]]:
+        touched_transforms = {staged.transform_id for staged in draft.transforms}
+        conflicts = []
+        for other_draft in self.store.drafts.values():
+            if other_draft.id == draft.id or other_draft.status != "open":
+                continue
+            if other_draft.metadata.get("field_split_plan_id") == plan.id:
+                other_batch_id = other_draft.metadata.get("split_batch_id")
+                other_batch = next((item for item in plan.batches if item.id == other_batch_id), None)
+                if other_batch is not None and other_batch.status == "published":
+                    continue
+            overlap = touched_transforms & {staged.transform_id for staged in other_draft.transforms}
+            if overlap:
+                conflicts.append(
+                    {
+                        "type": "concurrent_transform_mapping",
+                        "draft_id": other_draft.id,
+                        "transform_ids": sorted(overlap),
+                        "impact_chain": self._mapping_conflict_chain(sorted(overlap)),
+                    }
+                )
+        return conflicts
+
+    def _mapping_conflict_chain(self, transform_ids: set[str] | list[str]) -> dict[str, list[str]]:
+        fields = {
+            field_id
+            for edge in self._effective_edges().values()
+            if edge.transform_id in set(transform_ids)
+            for field_id in (edge.source_field_id, edge.target_field_id)
+        }
+        return {
+            "fields": sorted(fields),
+            "impact": sorted({downstream for field_id in fields for downstream in self.impact(field_id).all_nodes()}),
+        }
+
+    def publish_split_migration_batch(self, plan_id: str, batch_id: str, *, note: str | None = None) -> HistoryEntry:
+        plan = self._require_field_split(plan_id)
+        batch = next((item for item in plan.batches if item.id == batch_id), None)
+        if batch is None:
+            raise NotFoundError(f"split batch '{batch_id}' does not exist")
+        if batch.status != "open":
+            raise ValidationError(f"split batch '{batch_id}' is {batch.status}")
+        if batch.recheck_required:
+            raise ValidationError({"message": "batch requires recheck", "reasons": batch.recheck_reasons})
+        draft_id = f"split-draft:{plan.id}:{batch.id}"
+        draft = self._require_draft(draft_id)
+        backup_field_splits = {key: FieldSplitPlan.from_dict(item.to_dict()) for key, item in self.store.field_splits.items()}
+
+        def commit_hook() -> None:
+            batch.status = "published"
+            batch.published_at = self._utc_now()
+            for item in batch.dependency_keys:
+                decision = self._split_decision_map(plan)[tuple(item)]
+                decision.batch_id = batch.id
+
+        try:
+            entry = self.publish_draft(draft_id, note=note, commit_hook=commit_hook)
+            batch.status = "published"
+            batch.history_id = entry.id
+            batch.published_revision = entry.revision
+        except Exception:
+            self.store.field_splits = {
+                key: FieldSplitPlan.from_dict(item.to_dict())
+                for key, item in backup_field_splits.items()
+            }
+            raise
+        return entry
+
+    def withdraw_split_migration_batch(
+        self,
+        plan_id: str,
+        batch_id: str,
+        *,
+        note: str | None = None,
+    ) -> HistoryEntry:
+        plan = self._require_field_split(plan_id)
+        batch = next((item for item in plan.batches if item.id == batch_id), None)
+        if batch is None:
+            raise NotFoundError(f"split batch '{batch_id}' does not exist")
+        if batch.status != "published" or batch.history_id is None:
+            raise ValidationError(f"split batch '{batch_id}' is {batch.status}")
+
+        def commit_hook() -> None:
+            batch.status = "withdrawn"
+            batch.withdrawn_at = self._utc_now()
+            batch.recheck_required = False
+            batch.recheck_reasons = []
+            for item in batch.dependency_keys:
+                key = tuple(item)
+                decision = self._split_decision_map(plan).get(key)
+                if decision is not None and decision.batch_id == batch.id:
+                    decision.batch_id = None
+                    decision.status = "recheck"
+            withdrawn_targets = {tuple(item)[2] for item in batch.dependency_keys}
+            for other in plan.batches:
+                if other.id == batch.id or other.status != "published":
+                    continue
+                reasons = []
+                for other_key in {tuple(item) for item in other.dependency_keys}:
+                    upstream = self.upstream(other_key[2])
+                    chain = {other_key[2], *upstream.all_nodes()}
+                    if chain & withdrawn_targets:
+                        reasons.append(
+                            f"dependency {other_key[0]}:{other_key[1]}->{other_key[2]} depends on withdrawn chain"
+                        )
+                if reasons:
+                    other.recheck_required = True
+                    other.recheck_reasons.extend(reasons)
+
+        return self.withdraw_publish(batch.history_id, note=note, commit_hook=commit_hook)
+
+    def recheck_split_migration_batch(self, plan_id: str, batch_id: str) -> FieldSplitBatch:
+        plan = self._require_field_split(plan_id)
+        batch = next((item for item in plan.batches if item.id == batch_id), None)
+        if batch is None:
+            raise NotFoundError(f"split batch '{batch_id}' does not exist")
+        if batch.status != "published":
+            raise ValidationError(f"split batch '{batch_id}' is {batch.status}")
+        batch.recheck_required = False
+        batch.recheck_reasons = []
+        self.store.save()
+        return batch
+
+    def retire_split_old_field(self, plan_id: str, *, note: str | None = None) -> HistoryEntry:
+        plan = self._require_field_split(plan_id)
+        if plan.status != "open":
+            raise ValidationError(f"field split plan '{plan_id}' is {plan.status}")
+        active_dependencies = self._split_active_dependencies(plan)
+        if active_dependencies:
+            keys = [list(key) for key in sorted(active_dependencies)]
+            raise ValidationError(
+                {
+                    "message": "old field still has active dependencies",
+                    "dependencies": keys,
+                }
+            )
+        active_keys = set(active_dependencies)
+        unresolved = [
+            decision.to_dict()
+            for decision in plan.decisions
+            if self._decision_key(
+                decision.transform_id, decision.source_field_id, decision.target_field_id
+            )
+            in active_keys
+            and (decision.status in {"manual", "recheck"} or decision.batch_id is None)
+        ]
+        if unresolved:
+            raise ValidationError(
+                {
+                    "message": "old field has unresolved migration decisions",
+                    "decisions": unresolved,
+                }
+            )
+        draft_id = f"split-retire:{plan.id}"
+        existing = self.store.drafts.get(draft_id)
+        if existing is None:
+            draft = DraftProposal(
+                id=draft_id,
+                name=f"Retire split old field {plan.old_field_id}",
+                base_revision=self.store.revision,
+                metadata={"field_split_plan_id": plan.id, "retire_old_field": True},
+            )
+            self.store.drafts[draft_id] = draft
+        else:
+            draft = existing
+            draft.status = "open"
+            draft.base_revision = self.store.revision
+        draft.transforms = []
+        draft.deleted_fields = [plan.old_field_id]
+
+        def commit_hook() -> None:
+            plan.status = "retired"
+            plan.retirement_draft_id = draft_id
+
+        return self.publish_draft(draft_id, note=note, commit_hook=commit_hook)
 
     # --- Draft proposals -------------------------------------------------
 
@@ -1470,6 +2070,7 @@ class LineageService:
         *,
         confirm_stale: bool = False,
         note: str | None = None,
+        commit_hook=None,
     ) -> HistoryEntry:
         """Atomically apply a draft to the effective graph and record history.
 
@@ -1484,8 +2085,8 @@ class LineageService:
         draft = self._require_draft(draft_id)
         if draft.status != "open":
             raise ValidationError(f"draft '{draft_id}' is {draft.status}")
-        if not draft.transforms:
-            raise ValidationError("draft has no staged transforms")
+        if not draft.transforms and not draft.deleted_fields:
+            raise ValidationError("draft has no staged transforms or field deletions")
         if draft.metadata.get("pending"):
             raise ValidationError(
                 "draft is an unresolved merge output; resolve all conflicts first"
@@ -1512,6 +2113,14 @@ class LineageService:
         }
         backup_fields = {
             key: Field(**item.to_dict()) for key, item in self.store.fields.items()
+        }
+        backup_drafts = {
+            key: DraftProposal.from_dict(item.to_dict())
+            for key, item in self.store.drafts.items()
+        }
+        backup_field_splits = {
+            key: FieldSplitPlan.from_dict(item.to_dict())
+            for key, item in self.store.field_splits.items()
         }
         backup_revision = self.store.revision
         activated: list[str] = []
@@ -1571,6 +2180,8 @@ class LineageService:
                 if field_item is not None:
                     field_item.active = False
                     deactivated_fields.append(field_id)
+            if commit_hook is not None:
+                commit_hook()
             self.store.revision += 1
             draft.status = "published"
             entry = HistoryEntry(
@@ -1591,6 +2202,8 @@ class LineageService:
             self.store.transforms = backup_transforms
             self.store.contributions = backup_contributions
             self.store.fields = backup_fields
+            self.store.drafts = backup_drafts
+            self.store.field_splits = backup_field_splits
             self.store.revision = backup_revision
             draft.status = "open"
             self.store.history = [
@@ -1600,7 +2213,7 @@ class LineageService:
         return entry
 
     def withdraw_publish(
-        self, history_id: str, *, note: str | None = None
+        self, history_id: str, *, note: str | None = None, commit_hook=None
     ) -> HistoryEntry:
         """Reverse a recorded publish, keeping the full history intact.
 
@@ -1635,6 +2248,17 @@ class LineageService:
             for key, item in self.store.contributions.items()
         }
         backup_revision = self.store.revision
+        backup_fields = {
+            key: Field(**item.to_dict()) for key, item in self.store.fields.items()
+        }
+        backup_drafts = {
+            key: DraftProposal.from_dict(item.to_dict())
+            for key, item in self.store.drafts.items()
+        }
+        backup_field_splits = {
+            key: FieldSplitPlan.from_dict(item.to_dict())
+            for key, item in self.store.field_splits.items()
+        }
         try:
             for edge_id in original.activated:
                 edge = self.store.contributions.get(edge_id)
@@ -1652,6 +2276,8 @@ class LineageService:
                 field_item = self.store.fields.get(field_id)
                 if field_item is not None:
                     field_item.active = True
+            if commit_hook is not None:
+                commit_hook()
             self.store.revision += 1
             entry = HistoryEntry(
                 id=f"history:r{self.store.revision}:withdraw:{original.draft_id}",
@@ -1661,6 +2287,7 @@ class LineageService:
                 note=f"withdraw:{original.id}" if note is None else note,
                 activated=list(original.deactivated),
                 deactivated=list(original.activated),
+                deactivated_fields=list(original.deactivated_fields),
                 snapshot=self._graph_snapshot(),
             )
             self.store.history.append(entry)
@@ -1669,6 +2296,9 @@ class LineageService:
             self.store.transforms = backup_transforms
             self.store.contributions = backup_contributions
             self.store.revision = backup_revision
+            self.store.fields = backup_fields
+            self.store.drafts = backup_drafts
+            self.store.field_splits = backup_field_splits
             raise
         return entry
 
