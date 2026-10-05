@@ -197,6 +197,7 @@ class HistoryEntry:
     note: str | None = None
     activated: list[str] = field(default_factory=list)
     deactivated: list[str] = field(default_factory=list)
+    expression_updates: dict[str, str | None] = field(default_factory=dict)
     deactivated_fields: list[str] = field(default_factory=list)
     created_transforms: list[str] = field(default_factory=list)
     migration_batch_id: str | None = None

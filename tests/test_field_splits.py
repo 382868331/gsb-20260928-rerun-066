@@ -47,6 +47,67 @@ class FieldSplitMigrationTest(unittest.TestCase):
     def reload(self):
         self.service = LineageService(JsonLineageStore(self.path))
 
+    def test_withdraw_one_split_target_keeps_other_target_from_same_transform(self):
+        self.service.create_field("out.v1.shipping", "out.v1", "shipping")
+        self.service.submit_transform(
+            "t.order",
+            "build_order",
+            "1",
+            [
+                ("raw.v1.contact", "out.v1.shipping", "contact.shipping"),
+                ("raw.v1.contact", "out.v1.billing", "contact.billing"),
+            ],
+        )
+        self.service.create_field_split(
+            "split.contact", "raw.v1.contact", ["raw.v1.email"]
+        )
+        self.service.record_split_decision(
+            "split.contact",
+            "t.order",
+            "out.v1.shipping",
+            "raw.v1.email",
+            rationale="shipping semantics explicitly use email",
+        )
+        batch = self.service.create_split_migration_batch(
+            "shipping-only", "split.contact", ["out.v1.shipping"]
+        )
+
+        entry = self.service.publish_split_migration_batch("shipping-only")
+        old_shipping = "contrib:t.order:raw.v1.contact->out.v1.shipping"
+        new_shipping = "contrib:t.order:raw.v1.email->out.v1.shipping"
+        old_billing = "contrib:t.order:raw.v1.contact->out.v1.billing"
+        self.assertEqual(set(entry.activated), {new_shipping})
+        self.assertEqual(set(entry.deactivated), {old_shipping})
+        self.assertNotIn(old_billing, entry.activated)
+        self.assertNotIn(old_billing, entry.deactivated)
+        self.assertTrue(self.service.store.contributions[old_billing].active)
+
+        withdrawal = self.service.withdraw_publish(entry.id)
+        self.assertEqual(set(withdrawal.activated), {old_shipping})
+        self.assertEqual(set(withdrawal.deactivated), {new_shipping})
+        self.assertTrue(self.service.store.contributions[old_shipping].active)
+        self.assertFalse(self.service.store.contributions[new_shipping].active)
+        self.assertTrue(self.service.store.contributions[old_billing].active)
+        self.assertEqual(
+            self.service.store.contributions[old_shipping].expression,
+            "contact.shipping",
+        )
+        self.assertEqual(
+            self.service.store.contributions[old_billing].expression,
+            "contact.billing",
+        )
+        self.reload()
+        stored_batch = self.service.migration_batch("shipping-only")
+        self.assertEqual(stored_batch.status, "withdrawn")
+        self.assertEqual(stored_batch.history_id, entry.id)
+        self.assertEqual(stored_batch.published_at, entry.created_at)
+        self.assertEqual(
+            stored_batch.adopted_decisions[0]["new_field_id"], "raw.v1.email"
+        )
+        self.assertTrue(self.service.store.contributions[old_billing].active)
+        self.assertTrue(self.service.store.contributions[old_shipping].active)
+        self.assertFalse(self.service.store.contributions[new_shipping].active)
+
     def test_phased_split_keeps_shared_old_interpretation_and_preserves_withdraw_audit(self):
         split = self.service.create_field_split(
             "split.contact",
@@ -165,12 +226,39 @@ class FieldSplitMigrationTest(unittest.TestCase):
                 }
             ],
         )
-        self.service.publish_split_migration_batch("b2", confirm_stale=True)
+        second_entry = self.service.publish_split_migration_batch(
+            "b2", confirm_stale=True
+        )
         withdrawal = self.service.withdraw_publish(entry.id)
         self.assertEqual(self.service.migration_batch("b1").status, "withdrawn")
         self.assertTrue(self.service.migration_batch("b2").requires_recheck)
         self.assertEqual(self.service.migration_batch("b2").recheck_reasons,
                          ["upstream batch 'b1' was withdrawn"])
+        self.assertEqual(self.service.migration_batch("b2").status, "published")
+        self.assertEqual(self.service.migration_batch("b2").history_id, second_entry.id)
+        self.assertEqual(
+            self.service.migration_batch("b2").published_at, second_entry.created_at
+        )
+        self.assertEqual(
+            self.service.migration_batch("b2").adopted_decisions[0]["rationale"],
+            "customer semantics explicitly use email",
+        )
+        self.assertTrue(
+            self.service.store.contributions[
+                "contrib:t.profile:raw.v1.email->mid.v1.profile_billing"
+            ].active
+        )
+        self.assertTrue(
+            self.service.store.contributions[
+                "contrib:t.billing:mid.v1.profile_billing->out.v1.billing"
+            ].active
+        )
+        self.assertEqual(
+            self.service.store.contributions[
+                "contrib:t.profile:raw.v1.email->mid.v1.profile_billing"
+            ].expression,
+            "parse(email)",
+        )
         self.assertEqual(withdrawal.created_at is not None, True)
         self.assertEqual(
             set(self.service.upstream("mid.v1.profile").direct),

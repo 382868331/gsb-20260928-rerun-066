@@ -2059,7 +2059,11 @@ class LineageService:
             if diff.new_cycles:
                 raise ValidationError("migration would introduce a new graph cycle")
 
-        backup_transforms = dict(self.store.transforms)
+        before_snapshot = self._graph_snapshot()
+        backup_transforms = {
+            key: TransformVersion(**item.to_dict())
+            for key, item in self.store.transforms.items()
+        }
         backup_contributions = {
             key: Contribution(**item.to_dict())
             for key, item in self.store.contributions.items()
@@ -2075,9 +2079,15 @@ class LineageService:
             key: FieldSplit(**item.to_dict())
             for key, item in self.store.field_splits.items()
         }
+        backup_drafts = {
+            key: DraftProposal(**item.to_dict())
+            for key, item in self.store.drafts.items()
+        }
+        backup_history = list(self.store.history)
         backup_revision = self.store.revision
         activated: list[str] = []
         deactivated: list[str] = []
+        expression_updates: dict[str, str | None] = {}
         deactivated_fields: list[str] = []
         created_transforms: list[str] = []
         try:
@@ -2116,10 +2126,16 @@ class LineageService:
                             target_field_id=mapping["target_field_id"],
                             expression=mapping.get("expression"),
                         )
+                        activated.append(edge_id)
                     else:
+                        was_active = edge.active
+                        expression_changed = edge.expression != mapping.get("expression")
                         edge.active = True
                         edge.expression = mapping.get("expression")
-                    activated.append(edge_id)
+                        if not was_active:
+                            activated.append(edge_id)
+                        elif expression_changed:
+                            expression_updates[edge_id] = mapping.get("expression")
                 for edge in self.store.contributions.values():
                     if (
                         edge.transform_id == staged.transform_id
@@ -2159,11 +2175,12 @@ class LineageService:
                 note=note,
                 activated=activated,
                 deactivated=deactivated,
+                expression_updates=expression_updates,
                 deactivated_fields=deactivated_fields,
                 created_transforms=created_transforms,
                 migration_batch_id=migration_batch_id,
                 created_at=published_at,
-                snapshot=self._graph_snapshot(),
+                snapshot=before_snapshot,
             )
             self.store.history.append(entry)
             self.store.save()
@@ -2173,11 +2190,9 @@ class LineageService:
             self.store.fields = backup_fields
             self.store.migration_batches = backup_batches
             self.store.field_splits = backup_splits
+            self.store.drafts = backup_drafts
+            self.store.history = backup_history
             self.store.revision = backup_revision
-            draft.status = "open"
-            self.store.history = [
-                item for item in self.store.history if item.draft_id != draft_id or item.action != "publish"
-            ]
             raise
         return entry
 
@@ -2236,22 +2251,67 @@ class LineageService:
             if item.action == "withdraw"
         }
 
-        def edge_active_after_withdrawal(edge_id: str, active_in_original: bool) -> bool:
-            for later in self.store.history:
-                if later.action != "publish" or later.id == original.id:
-                    continue
-                if f"withdraw:{later.id}" in withdrawn_notes:
-                    continue
-                if edge_id in later.activated:
-                    return True
-                if edge_id in later.deactivated:
-                    return False
-            return not active_in_original
+        desired_edges = {
+            item["id"]: Contribution.from_dict(item)
+            for item in original.snapshot.get("contributions", [])
+        }
+        desired_transforms = {
+            item["id"]: TransformVersion.from_dict(item)
+            for item in original.snapshot.get("transforms", [])
+        }
+        desired_fields = {
+            item["id"]: Field.from_dict(item)
+            for item in original.snapshot.get("fields", [])
+        }
+        for later in self.store.history:
+            if (
+                later.action != "publish"
+                or later.id == original.id
+                or f"withdraw:{later.id}" in withdrawn_notes
+            ):
+                continue
+            for edge_id in later.activated:
+                desired = desired_edges.get(edge_id)
+                current_edge = self.store.contributions.get(edge_id)
+                if desired is None and current_edge is not None:
+                    desired = Contribution(**current_edge.to_dict())
+                    desired_edges[edge_id] = desired
+                if desired is not None:
+                    desired.active = True
+                    if current_edge is not None:
+                        desired.expression = current_edge.expression
+            for edge_id in later.deactivated:
+                desired = desired_edges.get(edge_id)
+                if desired is not None:
+                    desired.active = False
+            for edge_id, expression in later.expression_updates.items():
+                desired = desired_edges.get(edge_id)
+                if desired is not None:
+                    desired.active = True
+                    desired.expression = expression
+            for transform_id in later.created_transforms:
+                current_transform = self.store.transforms.get(transform_id)
+                desired = desired_transforms.get(transform_id)
+                if desired is None and current_transform is not None:
+                    desired = TransformVersion(**current_transform.to_dict())
+                    desired_transforms[transform_id] = desired
+                if desired is not None:
+                    desired.active = True
+            for field_id in later.deactivated_fields:
+                desired = desired_fields.get(field_id)
+                if desired is not None:
+                    desired.active = False
 
-        backup_transforms = dict(self.store.transforms)
+        backup_transforms = {
+            key: TransformVersion(**item.to_dict())
+            for key, item in self.store.transforms.items()
+        }
         backup_contributions = {
             key: Contribution(**item.to_dict())
             for key, item in self.store.contributions.items()
+        }
+        backup_fields = {
+            key: Field(**item.to_dict()) for key, item in self.store.fields.items()
         }
         backup_revision = self.store.revision
         backup_batches = {
@@ -2262,23 +2322,48 @@ class LineageService:
             key: FieldSplit(**item.to_dict())
             for key, item in self.store.field_splits.items()
         }
+        backup_history = list(self.store.history)
+        before_snapshot = self._graph_snapshot()
+        actual_activated: list[str] = []
+        actual_deactivated: list[str] = []
+        actual_expression_updates: dict[str, str | None] = {}
+        changed_edge_ids = {
+            *original.activated,
+            *original.deactivated,
+            *original.expression_updates,
+        }
         try:
-            for edge_id in original.activated:
+            for edge_id in changed_edge_ids:
                 edge = self.store.contributions.get(edge_id)
-                if edge is not None:
-                    edge.active = edge_active_after_withdrawal(edge_id, True)
-            for edge_id in original.deactivated:
-                edge = self.store.contributions.get(edge_id)
-                if edge is not None:
-                    edge.active = edge_active_after_withdrawal(edge_id, False)
+                desired = desired_edges.get(edge_id)
+                if edge is None:
+                    continue
+                was_active = edge.active
+                expression = edge.expression
+                edge.active = desired.active if desired is not None else False
+                if desired is not None:
+                    edge.expression = desired.expression
+                if was_active and not edge.active:
+                    actual_deactivated.append(edge_id)
+                elif not was_active and edge.active:
+                    actual_activated.append(edge_id)
+                elif was_active and edge.active and expression != edge.expression:
+                    actual_expression_updates[edge_id] = edge.expression
             for transform_id in original.created_transforms:
-                transform = self.store.transforms.get(transform_id)
-                if transform is not None:
-                    transform.active = False
+                desired = desired_transforms.get(transform_id)
+                if desired is None:
+                    transform = self.store.transforms.get(transform_id)
+                    if transform is not None:
+                        transform.active = False
+                else:
+                    transform = self.store.transforms.get(transform_id)
+                    if transform is not None:
+                        transform.active = desired.active
             for field_id in getattr(original, "deactivated_fields", []):
                 field_item = self.store.fields.get(field_id)
+                desired = desired_fields.get(field_id)
                 if field_item is not None:
-                    field_item.active = True
+                    field_item.active = desired.active if desired is not None else True
             withdrawn_batch = (
                 self.store.migration_batches.get(original.migration_batch_id)
                 if original.migration_batch_id
@@ -2292,11 +2377,12 @@ class LineageService:
                 action="withdraw",
                 draft_id=original.draft_id,
                 note=f"withdraw:{original.id}" if note is None else note,
-                activated=list(original.deactivated),
-                deactivated=list(original.activated),
+                activated=actual_activated,
+                deactivated=actual_deactivated,
+                expression_updates=actual_expression_updates,
                 migration_batch_id=original.migration_batch_id,
                 created_at=withdrawn_at,
-                snapshot=self._graph_snapshot(),
+                snapshot=before_snapshot,
             )
             self.store.history.append(entry)
             if withdrawn_batch is not None:
@@ -2335,8 +2421,10 @@ class LineageService:
         except Exception:
             self.store.transforms = backup_transforms
             self.store.contributions = backup_contributions
+            self.store.fields = backup_fields
             self.store.migration_batches = backup_batches
             self.store.field_splits = backup_splits
+            self.store.history = backup_history
             self.store.revision = backup_revision
             raise
         return entry
