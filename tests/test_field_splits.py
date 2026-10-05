@@ -254,5 +254,123 @@ class FieldSplitMigrationTest(unittest.TestCase):
             )
 
 
+class FieldSplitMultiTargetWithdrawTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "lineage.json"
+        self.service = LineageService(JsonLineageStore(self.path))
+        self.service.create_object("raw.v1", "raw", "v1")
+        self.service.create_object("out.v1", "out", "v1")
+        for field_name in ["contact", "email"]:
+            self.service.create_field(f"raw.v1.{field_name}", "raw.v1", field_name)
+        for field_name in ["shipping", "billing"]:
+            self.service.create_field(f"out.v1.{field_name}", "out.v1", field_name)
+        self.service.submit_transform(
+            "t.ship",
+            "build_shipping",
+            "1",
+            [
+                ("raw.v1.contact", "out.v1.shipping", "contact"),
+                ("raw.v1.contact", "out.v1.billing", "contact"),
+            ],
+        )
+
+    def reload(self):
+        self.service = LineageService(JsonLineageStore(self.path))
+
+    def publish_shipping_batch(self):
+        self.service.create_field_split(
+            "split.contact", "raw.v1.contact", ["raw.v1.email"]
+        )
+        self.service.record_split_decision(
+            "split.contact", "t.ship", "out.v1.shipping", "raw.v1.email"
+        )
+        self.service.create_split_migration_batch(
+            "b1", "split.contact", ["out.v1.shipping"]
+        )
+        return self.service.publish_split_migration_batch("b1", note="release b1")
+
+    def test_withdraw_restores_only_migrated_target_and_keeps_unmigrated_edge(self):
+        entry = self.publish_shipping_batch()
+        self.assertEqual(
+            entry.activated, ["contrib:t.ship:raw.v1.email->out.v1.shipping"]
+        )
+        self.assertEqual(
+            entry.deactivated, ["contrib:t.ship:raw.v1.contact->out.v1.shipping"]
+        )
+        self.assertEqual(
+            set(self.service.upstream("out.v1.shipping").direct), {"raw.v1.email"}
+        )
+        self.assertEqual(
+            set(self.service.upstream("out.v1.billing").direct), {"raw.v1.contact"}
+        )
+
+        self.reload()
+        withdrawal = self.service.withdraw_publish(entry.id)
+        self.assertEqual(self.service.migration_batch("b1").status, "withdrawn")
+        self.assertEqual(
+            set(self.service.upstream("out.v1.shipping").direct), {"raw.v1.contact"}
+        )
+        # The billing edge was never added by this batch and must stay active.
+        self.assertEqual(
+            set(self.service.upstream("out.v1.billing").direct), {"raw.v1.contact"}
+        )
+
+        # Reopening from disk keeps the same graph and audit records.
+        self.reload()
+        self.assertEqual(
+            set(self.service.upstream("out.v1.shipping").direct), {"raw.v1.contact"}
+        )
+        self.assertEqual(
+            set(self.service.upstream("out.v1.billing").direct), {"raw.v1.contact"}
+        )
+        self.assertEqual(self.service.migration_batch("b1").status, "withdrawn")
+        notes = [item.note for item in self.service.history()]
+        self.assertIn(f"withdraw:{entry.id}", notes)
+        self.assertEqual(withdrawal.action, "withdraw")
+
+    def test_withdraw_flags_dependent_batch_and_preserves_its_audit(self):
+        entry = self.publish_shipping_batch()
+        # A later batch migrates billing while depending on the migrated
+        # shipping target; it must be flagged for recheck after withdrawal.
+        self.service.record_split_decision(
+            "split.contact", "t.ship", "out.v1.billing", "raw.v1.email"
+        )
+        self.service.create_split_migration_batch(
+            "b2", "split.contact", ["out.v1.shipping", "out.v1.billing"]
+        )
+        self.service.publish_split_migration_batch("b2", confirm_stale=True)
+        adopted = self.service.migration_batch("b2").adopted_decisions
+        published_at = self.service.migration_batch("b2").published_at
+
+        self.reload()
+        self.service.withdraw_publish(entry.id)
+        self.assertEqual(self.service.migration_batch("b1").status, "withdrawn")
+        self.assertEqual(
+            set(self.service.upstream("out.v1.shipping").direct), {"raw.v1.contact"}
+        )
+        # b2 is still published, so billing keeps b2's migrated edge.
+        self.assertEqual(
+            set(self.service.upstream("out.v1.billing").direct), {"raw.v1.email"}
+        )
+        self.assertTrue(self.service.migration_batch("b2").requires_recheck)
+        self.assertEqual(
+            self.service.migration_batch("b2").adopted_decisions, adopted
+        )
+        self.assertEqual(
+            self.service.migration_batch("b2").published_at, published_at
+        )
+
+        self.reload()
+        self.assertTrue(self.service.migration_batch("b2").requires_recheck)
+        self.assertEqual(
+            self.service.migration_batch("b2").published_at, published_at
+        )
+        self.assertEqual(
+            set(self.service.upstream("out.v1.billing").direct), {"raw.v1.email"}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

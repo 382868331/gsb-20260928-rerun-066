@@ -2116,10 +2116,12 @@ class LineageService:
                             target_field_id=mapping["target_field_id"],
                             expression=mapping.get("expression"),
                         )
+                        activated.append(edge_id)
                     else:
+                        if not edge.active:
+                            activated.append(edge_id)
                         edge.active = True
                         edge.expression = mapping.get("expression")
-                    activated.append(edge_id)
                 for edge in self.store.contributions.values():
                     if (
                         edge.transform_id == staged.transform_id
